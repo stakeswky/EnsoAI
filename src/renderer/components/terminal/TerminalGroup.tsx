@@ -16,6 +16,7 @@ interface TerminalGroupProps {
   onTabsChange: (groupId: string, tabs: TerminalTab[], activeTabId: string | null) => void;
   onGroupClick: () => void;
   onGroupEmpty: (groupId: string) => void;
+  onTabClose?: (tabId: string) => void;
   onTabMoveToGroup?: (
     tabId: string,
     sourceGroupId: string,
@@ -31,6 +32,7 @@ export function TerminalGroup({
   onTabsChange,
   onGroupClick,
   onGroupEmpty,
+  onTabClose,
   onTabMoveToGroup,
 }: TerminalGroupProps) {
   const { t } = useI18n();
@@ -54,6 +56,7 @@ export function TerminalGroup({
 
   const handleCloseTab = useCallback(
     (id: string) => {
+      onTabClose?.(id);
       const newTabs = tabs.filter((t) => t.id !== id);
 
       if (newTabs.length === 0) {
@@ -69,7 +72,7 @@ export function TerminalGroup({
       }
       onTabsChange(group.id, newTabs, newActiveTabId);
     },
-    [tabs, activeTabId, group.id, onTabsChange, onGroupEmpty]
+    [tabs, activeTabId, group.id, onTabsChange, onGroupEmpty, onTabClose]
   );
 
   const handleSelectTab = useCallback(

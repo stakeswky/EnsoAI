@@ -12,9 +12,12 @@ function getPathSep(): '/' | '\\' {
 /**
  * Join path segments with platform-specific separator
  */
-function joinPath(...segments: (string | undefined)[]): string {
-  const sep = getPathSep();
+function joinPathWithSeparator(sep: '/' | '\\', ...segments: (string | undefined)[]): string {
   return segments.filter(Boolean).join(sep);
+}
+
+function joinPath(...segments: (string | undefined)[]): string {
+  return joinPathWithSeparator(getPathSep(), ...segments);
 }
 
 /**
@@ -111,7 +114,8 @@ export function generateClonePath(
   url: string,
   baseDir: string,
   hostMappings: GitHostMapping[],
-  useOrganizedStructure: boolean
+  useOrganizedStructure: boolean,
+  pathSeparator: '/' | '\\' = getPathSep()
 ): { targetDir: string; repoName: string; fullPath: string; error?: string } {
   const parsed = parseGitUrl(url);
   if (!parsed) {
@@ -132,12 +136,12 @@ export function generateClonePath(
     // Organized structure: baseDir/host/owner/repo
     const hostDir = findHostDirname(host, hostMappings);
     // Join all path segments (owner, subgroups, etc.) but exclude the repo name
-    const ownerPath = pathSegments.slice(0, -1).join(getPathSep());
-    targetDir = joinPath(targetDir, hostDir, ownerPath);
+    const ownerPath = pathSegments.slice(0, -1).join(pathSeparator);
+    targetDir = joinPathWithSeparator(pathSeparator, targetDir, hostDir, ownerPath);
   }
   // else: flat structure - clone directly to baseDir
 
-  const fullPath = joinPath(targetDir, repo);
+  const fullPath = joinPathWithSeparator(pathSeparator, targetDir, repo);
 
   return {
     targetDir,

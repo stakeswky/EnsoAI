@@ -1,3 +1,4 @@
+import { WORKSPACE_RESOURCE_URI_PREFIX } from '@shared/types';
 import { ArrowDown } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -275,15 +276,6 @@ export function AgentTerminal({
       stopActivityPolling();
     };
   }, [terminalSessionId, clearRuntimeState, stopActivityPolling]);
-
-  // Cleanup tmux session on unmount
-  useEffect(() => {
-    return () => {
-      if (tmuxSessionNameRef.current) {
-        window.electronAPI.tmux.killSession(tmuxSessionNameRef.current);
-      }
-    };
-  }, []);
 
   // Build command with session args
   const { command, env } = useMemo(() => {
@@ -737,6 +729,8 @@ export function AgentTerminal({
     refreshRenderer,
     write,
   } = useXterm({
+    sessionId: terminalSessionId ?? undefined,
+    persistent: Boolean(terminalSessionId),
     cwd,
     command,
     env,
@@ -927,7 +921,9 @@ export function AgentTerminal({
       let message = content;
 
       if (imagePaths.length > 0) {
-        const escapedPaths = imagePaths.map((p) => (p.includes(' ') ? `"${p}"` : p));
+        const escapedPaths = imagePaths.map((p) =>
+          p.startsWith(WORKSPACE_RESOURCE_URI_PREFIX) || p.includes(' ') ? `"${p}"` : p
+        );
         message += `\n\n${escapedPaths.join(' ')}`;
       }
 

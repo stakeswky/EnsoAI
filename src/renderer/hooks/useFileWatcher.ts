@@ -1,5 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useState } from 'react';
+import { useRemoteStore } from '@/stores/remote';
 import { useShouldPoll } from './useWindowFocus';
 
 interface FileChangeEvent {
@@ -11,6 +12,7 @@ export function useFileWatcher(dirPath: string | null) {
   const [changes, setChanges] = useState<FileChangeEvent[]>([]);
   const queryClient = useQueryClient();
   const shouldPoll = useShouldPoll();
+  const remoteConnectionState = useRemoteStore((state) => state.status?.state);
 
   const handleChange = useCallback(
     (event: FileChangeEvent) => {
@@ -21,6 +23,7 @@ export function useFileWatcher(dirPath: string | null) {
   );
 
   useEffect(() => {
+    void remoteConnectionState;
     if (!dirPath || !shouldPoll) return;
 
     window.electronAPI.file.watchStart(dirPath);
@@ -30,7 +33,7 @@ export function useFileWatcher(dirPath: string | null) {
       unsubscribe();
       window.electronAPI.file.watchStop(dirPath);
     };
-  }, [dirPath, handleChange, shouldPoll]);
+  }, [dirPath, handleChange, shouldPoll, remoteConnectionState]);
 
   const clearChanges = useCallback(() => {
     setChanges([]);

@@ -27,7 +27,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   ALL_GROUP_ID,
   type Repository,
@@ -39,12 +39,14 @@ import {
 import {
   DEFAULT_REPOSITORY_SETTINGS,
   getRepositorySettings,
+  getRepositorySettingsRevision,
   getStoredGroupCollapsedState,
   getStoredRepositorySettings,
   normalizePath,
   type RepositorySettings,
   saveGroupCollapsedState,
   saveRepositorySettings,
+  subscribeRepositorySettings,
 } from '@/App/storage';
 import { GitSyncButton } from '@/components/git/GitSyncButton';
 import {
@@ -85,6 +87,7 @@ import { useI18n } from '@/i18n';
 import { heightVariants, springFast, springStandard } from '@/lib/motion';
 import { cn } from '@/lib/utils';
 import { useSettingsStore } from '@/stores/settings';
+import { useWorkspaceMirrorStore } from '@/stores/workspaceMirror';
 import { useWorktreeActivityStore } from '@/stores/worktreeActivity';
 import { RunningProjectsPopover } from './RunningProjectsPopover';
 
@@ -249,12 +252,22 @@ export function TreeSidebar({
   const [repoSettingsMap, setRepoSettingsMap] = useState<Record<string, RepositorySettings>>(
     getStoredRepositorySettings
   );
+  const repoSettingsRevision = useSyncExternalStore(
+    subscribeRepositorySettings,
+    getRepositorySettingsRevision
+  );
+  const canEditSharedWorkspace = useWorkspaceMirrorStore(
+    (state) =>
+      state.projectionTarget !== 'transitioning' &&
+      (state.projectionTarget === 'local' || state.ownsControl)
+  );
   const refreshRepoSettings = useCallback(() => {
     setRepoSettingsMap(getStoredRepositorySettings());
   }, []);
   useEffect(() => {
+    void repoSettingsRevision;
     refreshRepoSettings();
-  }, [refreshRepoSettings]);
+  }, [refreshRepoSettings, repoSettingsRevision]);
 
   // Create worktree dialog (triggered from context menu)
   const [createWorktreeDialogOpen, setCreateWorktreeDialogOpen] = useState(false);
@@ -1267,6 +1280,7 @@ export function TreeSidebar({
             {/* New Worktree button */}
             <button
               type="button"
+              disabled={!canEditSharedWorkspace}
               className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent"
               onClick={() => {
                 setRepoMenuOpen(false);
@@ -1305,6 +1319,7 @@ export function TreeSidebar({
             {/* Hide Repository */}
             <button
               type="button"
+              disabled={!canEditSharedWorkspace}
               className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent"
               onClick={() => {
                 setRepoMenuOpen(false);

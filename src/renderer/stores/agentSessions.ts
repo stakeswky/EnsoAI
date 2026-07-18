@@ -1,3 +1,4 @@
+import type { WorkspaceResourceReference } from '@shared/types';
 import { create } from 'zustand';
 import { subscribeWithSelector } from 'zustand/middleware';
 import { normalizePath, pathsEqual } from '@/App/storage';
@@ -5,6 +6,7 @@ import type { Session } from '@/components/chat/SessionBar';
 import type { AgentGroupState } from '@/components/chat/types';
 import { createInitialGroupState } from '@/components/chat/types';
 import { useAgentStatusStore } from './agentStatus';
+import { isLocalWorkspaceProjection } from './workspaceMirror';
 
 // Global storage key for all sessions across all repos
 export const SESSIONS_STORAGE_KEY = 'enso-agent-sessions';
@@ -23,6 +25,7 @@ export interface EnhancedInputState {
   open: boolean;
   content: string;
   imagePaths: string[];
+  resources: WorkspaceResourceReference[];
 }
 
 // Default state object (cached and frozen to prevent accidental mutation)
@@ -30,6 +33,7 @@ const DEFAULT_ENHANCED_INPUT_STATE: EnhancedInputState = Object.freeze({
   open: false,
   content: '',
   imagePaths: [],
+  resources: [],
 });
 
 // Aggregated state for UI display
@@ -91,6 +95,11 @@ interface AgentSessionsState {
   setEnhancedInputOpen: (sessionId: string, open: boolean) => void;
   setEnhancedInputContent: (sessionId: string, content: string) => void;
   setEnhancedInputImages: (sessionId: string, imagePaths: string[]) => void;
+  resolveEnhancedInputResources: (
+    sessionId: string,
+    imagePaths: string[],
+    resources: WorkspaceResourceReference[]
+  ) => void;
   clearEnhancedInput: (sessionId: string, keepOpen?: boolean) => void; // Clear content after sending
 
   // Aggregated state selectors
@@ -118,6 +127,7 @@ function loadFromStorage(): { sessions: Session[]; activeIds: Record<string, str
 }
 
 function saveToStorage(sessions: Session[], activeIds: Record<string, string | null>): void {
+  if (!isLocalWorkspaceProjection()) return;
   // Only persist sessions that are:
   // 1. Using agents that support resumption (e.g., claude)
   // 2. Activated (user has pressed Enter at least once)
@@ -207,7 +217,7 @@ export const useAgentSessionsStore = create<AgentSessionsState>()(
           // Initialize enhanced input state for new session to ensure auto-popup works
           enhancedInputStates: {
             ...state.enhancedInputStates,
-            [session.id]: { open: false, content: '', imagePaths: [] },
+            [session.id]: { open: false, content: '', imagePaths: [], resources: [] },
           },
         };
       }),
@@ -521,7 +531,18 @@ export const useAgentSessionsStore = create<AgentSessionsState>()(
         return {
           enhancedInputStates: {
             ...prev.enhancedInputStates,
-            [sessionId]: { ...current, imagePaths },
+            [sessionId]: { ...current, imagePaths, resources: [] },
+          },
+        };
+      }),
+
+    resolveEnhancedInputResources: (sessionId, imagePaths, resources) =>
+      set((prev) => {
+        const current = prev.enhancedInputStates[sessionId] ?? DEFAULT_ENHANCED_INPUT_STATE;
+        return {
+          enhancedInputStates: {
+            ...prev.enhancedInputStates,
+            [sessionId]: { ...current, imagePaths, resources },
           },
         };
       }),
@@ -533,7 +554,7 @@ export const useAgentSessionsStore = create<AgentSessionsState>()(
         return {
           enhancedInputStates: {
             ...prev.enhancedInputStates,
-            [sessionId]: { open: keepOpen, content: '', imagePaths: [] },
+            [sessionId]: { open: keepOpen, content: '', imagePaths: [], resources: [] },
           },
         };
       }),

@@ -1,4 +1,4 @@
-export type AgentTaskStatus = 'idle' | 'running' | 'waiting' | 'completed' | 'paused';
+export type AgentTaskStatus = 'idle' | 'running' | 'waiting' | 'completed' | 'paused' | 'error';
 
 export interface AgentTask {
   sessionId: string;

@@ -3,7 +3,12 @@ import { extname, join } from 'node:path';
 import { pathToFileURL, URL } from 'node:url';
 import { electronApp, optimizer } from '@electron-toolkit/utils';
 import { type Locale, normalizeLocale } from '@shared/i18n';
-import { IPC_CHANNELS, type OpenContext, type ProxySettings } from '@shared/types';
+import {
+  IPC_CHANNELS,
+  isWorkspaceResourceId,
+  type OpenContext,
+  type ProxySettings,
+} from '@shared/types';
 import { customProtocolUriToPath, type SupportedFileUrlPlatform } from '@shared/utils/fileUrl';
 import { app, BrowserWindow, ipcMain, Menu, net, protocol } from 'electron';
 
@@ -53,8 +58,12 @@ import { checkGitInstalled } from './services/git/checkGit';
 import { gitAutoFetchService } from './services/git/GitAutoFetchService';
 import { setCurrentLocale } from './services/i18n';
 import { buildAppMenu } from './services/MenuBuilder';
-import { tryFetchRemoteFileResponse } from './services/remote/remoteFileFetch';
+import {
+  tryFetchRemoteFileResponse,
+  tryFetchWorkspaceResourceResponse,
+} from './services/remote/remoteFileFetch';
 import { webInspectorServer } from './services/webInspector';
+import { initializeWorkspaceMirrorRuntime } from './services/workspace/workspaceMirrorRuntime';
 import log, { initLogger } from './utils/logger';
 import { destroyAgentTaskPanelWindow } from './windows/AgentTaskPanelWindow';
 import { createMainWindow } from './windows/MainWindow';
@@ -159,11 +168,6 @@ function sendOpenContext(context: OpenContext): void {
   }
 }
 
-// Backwards compatible wrapper for simple path opening
-function sendOpenPath(path: string): void {
-  sendOpenContext({ path });
-}
-
 // Send focus session event to renderer
 function sendFocusSession(params: FocusSessionParams): void {
   const windows = BrowserWindow.getAllWindows();
@@ -230,8 +234,31 @@ function handleCommandLineArgs(argv: string[]): void {
   }
 
   // Send collected context if path is present
-  if (context && context.path) {
+  if (context?.path) {
     sendOpenContext(context);
+  }
+}
+
+type LocalResourceRequest = { resourceId: string } | { invalid: true };
+
+/** Parse the reserved local-file://resource/<id> preview endpoint. */
+function parseLocalResourceRequest(requestUrl: string): LocalResourceRequest | null {
+  try {
+    const parsed = new URL(requestUrl);
+    if (parsed.protocol !== 'local-file:' || parsed.hostname !== 'resource') return null;
+    if (parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash) {
+      return { invalid: true };
+    }
+
+    const segments = parsed.pathname.split('/');
+    if (segments.length !== 2 || segments[0] !== '' || !segments[1]) {
+      return { invalid: true };
+    }
+
+    const resourceId = decodeURIComponent(segments[1]);
+    return isWorkspaceResourceId(resourceId) ? { resourceId } : { invalid: true };
+  } catch {
+    return { invalid: true };
   }
 }
 
@@ -343,6 +370,7 @@ async function init(): Promise<void> {
   }
 
   // Register IPC handlers
+  await initializeWorkspaceMirrorRuntime(app.getPath('userData'));
   registerIpcHandlers();
 
   // Register Claude IDE Bridge IPC handlers (bridge starts when enabled in settings)
@@ -365,6 +393,18 @@ app.whenReady().then(async () => {
   // Register protocol to handle local file:// URLs for markdown images
   protocol.handle('local-file', async (request) => {
     try {
+      const resourceRequest = parseLocalResourceRequest(request.url);
+      if (resourceRequest) {
+        if ('invalid' in resourceRequest) {
+          return new Response('Bad Request', { status: 400 });
+        }
+
+        const resourceResponse = await tryFetchWorkspaceResourceResponse(
+          resourceRequest.resourceId
+        );
+        return resourceResponse ?? new Response('Not Found', { status: 404 });
+      }
+
       const filePath = customProtocolUriToPath(
         request.url,
         'local-file',
@@ -489,13 +529,6 @@ app.whenReady().then(async () => {
         }
       } catch {
         // stat failed → file doesn't exist, will be caught below
-      }
-
-      // When attached to a remote host, serve media bytes from the host
-      // (full-body response; no Range support for remote video).
-      const remoteMediaResponse = await tryFetchRemoteFileResponse(filePath);
-      if (remoteMediaResponse) {
-        return remoteMediaResponse;
       }
 
       // Video files: stream with Range request support for <video> element

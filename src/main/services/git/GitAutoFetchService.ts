@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { IPC_CHANNELS } from '@shared/types';
 import type { BrowserWindow } from 'electron';
 import { broadcastToRemoteClients } from '../remote/RemoteHostServer';
+import { getWorkspaceMirrorService } from '../workspace/workspaceMirrorRuntime';
 import { GitService } from './GitService';
 
 const FETCH_INTERVAL_MS = 5 * 60 * 1000;
@@ -115,7 +116,7 @@ class GitAutoFetchService {
   private async fetchAll(): Promise<void> {
     if (!this.enabled || this.worktreePaths.size === 0 || this.fetching) return;
     this.fetching = true;
-    const hadChanges = false;
+    let hadChanges = false;
 
     try {
       this.lastFetchTime = Date.now();
@@ -129,6 +130,10 @@ class GitAutoFetchService {
             git.fetch(),
             new Promise((_, reject) => setTimeout(() => reject(new Error('fetch timeout')), 30000)),
           ]);
+          // GitService intentionally exposes no fetch summary. A successful
+          // fetch may have advanced a remote ref, so invalidate derived
+          // status/log consumers and let them cheaply re-query.
+          hadChanges = true;
 
           if (!this.enabled) break;
 
@@ -159,10 +164,10 @@ class GitAutoFetchService {
       }
     }
 
-    this.notifyCompleted();
+    this.notifyCompleted(hadChanges);
   }
 
-  private notifyCompleted(): void {
+  private notifyCompleted(hadChanges: boolean): void {
     const payload = { timestamp: Date.now() };
     if (this.mainWindow && !this.mainWindow.isDestroyed()) {
       this.mainWindow.webContents.send(IPC_CHANNELS.GIT_AUTO_FETCH_COMPLETED, payload);
@@ -170,6 +175,16 @@ class GitAutoFetchService {
     // Also notify attached remote dev clients (auto-fetch runs on the host
     // for repos registered by remote windows).
     broadcastToRemoteClients(IPC_CHANNELS.GIT_AUTO_FETCH_COMPLETED, payload);
+    if (hadChanges) {
+      void getWorkspaceMirrorService()
+        .invalidateResource({
+          resourceKey: 'git-status:all',
+          domain: 'git-status',
+          entityId: null,
+          reason: 'changed',
+        })
+        .catch(() => undefined);
+    }
   }
 
   /**
@@ -191,7 +206,7 @@ class GitAutoFetchService {
 
         const timer = setTimeout(() => {
           this.headDebounceTimers.delete(worktreePath);
-          this.notifyCompleted();
+          this.notifyCompleted(true);
         }, HEAD_CHANGE_DEBOUNCE_MS);
 
         this.headDebounceTimers.set(worktreePath, timer);

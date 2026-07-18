@@ -1,10 +1,25 @@
 import type { TerminalSession } from '@shared/types';
 import { create } from 'zustand';
+import type { TerminalGroup } from '@/components/terminal/types';
+
+export interface TerminalWorktreeGroupState {
+  groups: TerminalGroup[];
+  activeGroupId: string | null;
+  flexPercents: number[];
+  originalPath?: string;
+}
+
+export type TerminalWorktreeGroupStates = Record<string, TerminalWorktreeGroupState>;
+
+export function createInitialTerminalGroupState(originalPath = ''): TerminalWorktreeGroupState {
+  return { groups: [], activeGroupId: null, flexPercents: [], originalPath };
+}
 
 interface TerminalState {
   sessions: TerminalSession[];
   activeSessionId: string | null;
   quickTerminalSessions: Record<string, string>; // worktreePath -> sessionId
+  worktreeGroupStates: TerminalWorktreeGroupStates;
 
   addSession: (session: TerminalSession) => void;
   removeSession: (id: string) => void;
@@ -17,12 +32,18 @@ interface TerminalState {
   getQuickTerminalSession: (worktreePath: string) => string | undefined;
   getAllQuickTerminalCwds: () => string[];
   removeQuickTerminalSession: (worktreePath: string) => void;
+  setWorktreeGroupStates: (
+    updater:
+      | TerminalWorktreeGroupStates
+      | ((current: TerminalWorktreeGroupStates) => TerminalWorktreeGroupStates)
+  ) => void;
 }
 
 export const useTerminalStore = create<TerminalState>((set, get) => ({
   sessions: [],
   activeSessionId: null,
   quickTerminalSessions: {},
+  worktreeGroupStates: {},
 
   addSession: (session) =>
     set((state) => ({
@@ -55,4 +76,9 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       const { [worktreePath]: _, ...rest } = state.quickTerminalSessions;
       return { quickTerminalSessions: rest };
     }),
+  setWorktreeGroupStates: (updater) =>
+    set((state) => ({
+      worktreeGroupStates:
+        typeof updater === 'function' ? updater(state.worktreeGroupStates) : updater,
+    })),
 }));

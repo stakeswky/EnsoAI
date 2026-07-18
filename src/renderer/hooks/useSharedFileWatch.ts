@@ -1,5 +1,6 @@
 import { getPathBasename, normalizePath, trimTrailingPathSeparators } from '@shared/utils/path';
 import { useEffect, useMemo, useRef } from 'react';
+import { useRemoteStore } from '@/stores/remote';
 
 type FileChangeEvent = {
   type: 'create' | 'update' | 'delete';
@@ -25,6 +26,7 @@ export function useSharedFileWatch(
   options?: { enabled?: boolean }
 ) {
   const enabled = options?.enabled ?? true;
+  const remoteConnectionState = useRemoteStore((state) => state.status?.state);
 
   const normalizedDirPath = useMemo(
     () => (dirPath ? normalizeWatchedPath(dirPath) : null),
@@ -34,6 +36,7 @@ export function useSharedFileWatch(
   onChangeRef.current = onChange;
 
   useEffect(() => {
+    void remoteConnectionState;
     if (!dirPath || !normalizedDirPath || !enabled) return;
 
     const key = normalizedDirPath;
@@ -74,5 +77,5 @@ export function useSharedFileWatch(
         watches.delete(key);
       }
     };
-  }, [dirPath, normalizedDirPath, enabled]);
+  }, [dirPath, normalizedDirPath, enabled, remoteConnectionState]);
 }

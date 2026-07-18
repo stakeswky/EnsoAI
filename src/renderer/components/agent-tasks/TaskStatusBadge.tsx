@@ -28,6 +28,10 @@ const statusConfig: Record<AgentTaskStatus, { dotClass: string; label: string }>
     dotClass: 'bg-muted-foreground',
     label: 'Paused',
   },
+  error: {
+    dotClass: 'bg-red-500',
+    label: 'Error',
+  },
 };
 
 function TaskStatusBadgeComponent({ status, className }: TaskStatusBadgeProps) {

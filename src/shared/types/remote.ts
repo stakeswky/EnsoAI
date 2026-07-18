@@ -3,6 +3,7 @@
  * A client EnsoAI window attaches to a host EnsoAI instance over WebSocket
  * (Tailscale LAN) and forwards whitelisted IPC channels to the host.
  */
+import type { ControllerLease, WorkspaceSyncPhase } from './workspaceMirror';
 
 export const REMOTE_PROTOCOL_VERSION = 1;
 export const REMOTE_DEFAULT_PORT = 48925;
@@ -58,7 +59,15 @@ export interface RemoteHostStatus {
   tailscaleAddress: string | null;
   token: string | null;
   clientCount: number;
+  mirrorV2Enabled?: boolean;
   error?: string;
+}
+
+export interface RemotePairedDeviceInfo {
+  deviceId: string;
+  scopes: Array<'mirror.read' | 'mirror.control'>;
+  pairedAt: number;
+  revokedAt: number | null;
 }
 
 /** Client connection status (for client-side UI) */
@@ -69,6 +78,12 @@ export interface RemoteClientStatus {
   host: string | null;
   port: number | null;
   hostInfo: RemoteHostInfo | null;
+  mirrorSyncPhase?: WorkspaceSyncPhase;
+  mirrorRevision?: number;
+  mirrorProtocol?: 'v1' | 'v2';
+  mirrorController?: ControllerLease | null;
+  mirrorOwnsControl?: boolean;
+  mirrorLastResyncReason?: string;
   error?: string;
 }
 
@@ -76,6 +91,9 @@ export interface RemoteConnectOptions {
   host: string;
   port: number;
   token: string;
+  deviceId?: string;
+  clientId?: string;
+  mirrorV2?: boolean;
 }
 
 /** Settings persisted on the host side (settings.json -> remoteHost) */
@@ -85,6 +103,7 @@ export interface RemoteHostSettings {
   /** 'tailscale' (auto-detect) | 'all' (0.0.0.0) | 'localhost' */
   bind: 'tailscale' | 'all' | 'localhost';
   token: string;
+  mirrorV2Enabled?: boolean;
 }
 
 /**
@@ -99,6 +118,10 @@ export const REMOTE_FORWARDED_PREFIXES = [
   'git:',
   'worktree:',
   'temp:',
+  'todo:',
+  'agent:',
+  'tmux:',
+  'workspaceMirror:',
 ] as const;
 
 export function isRemoteForwardedChannel(channel: string): boolean {

@@ -2,6 +2,7 @@ import type { FileEntry } from '@shared/types';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { loadFileTreeExpandedPaths, saveFileTreeExpandedPaths } from '@/App/storage';
+import { useRemoteStore } from '@/stores/remote';
 
 interface UseFileTreeOptions {
   rootPath: string | undefined;
@@ -16,6 +17,7 @@ interface FileTreeNode extends FileEntry {
 
 export function useFileTree({ rootPath, enabled = true, isActive = true }: UseFileTreeOptions) {
   const queryClient = useQueryClient();
+  const remoteConnectionState = useRemoteStore((state) => state.status?.state);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() =>
     rootPath ? loadFileTreeExpandedPaths(rootPath) : new Set()
   );
@@ -328,6 +330,7 @@ export function useFileTree({ rootPath, enabled = true, isActive = true }: UseFi
 
   // File watch effect - always watch, but only update UI when active
   useEffect(() => {
+    void remoteConnectionState;
     if (!rootPath || !enabled) return;
 
     // Start watching
@@ -366,7 +369,7 @@ export function useFileTree({ rootPath, enabled = true, isActive = true }: UseFi
       unsubscribe();
       window.electronAPI.file.watchStop(rootPath);
     };
-  }, [rootPath, enabled, queryClient, refreshNodeChildren]);
+  }, [rootPath, enabled, queryClient, refreshNodeChildren, remoteConnectionState]);
 
   // File operations
   const createFile = useCallback(

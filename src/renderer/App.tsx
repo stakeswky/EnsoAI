@@ -33,6 +33,7 @@ import {
   useSettingsState,
   useTempWorkspaceSync,
   useTerminalNavigation,
+  useWorkspaceMirrorBridge,
   useWorktreeSelection,
   useWorktreeState,
   useWorktreeSync,
@@ -94,6 +95,7 @@ import { useInitScriptStore } from './stores/initScript';
 import { initRemoteStatusListener, useEffectiveEnv } from './stores/remote';
 import { useSettingsStore } from './stores/settings';
 import { useTempWorkspaceStore } from './stores/tempWorkspace';
+import { initWorkspaceMirrorSync, isLocalWorkspaceProjection } from './stores/workspaceMirror';
 import { useWorktreeStore } from './stores/worktree';
 import { initAgentActivityListener, useWorktreeActivityStore } from './stores/worktreeActivity';
 
@@ -102,6 +104,7 @@ initCloneProgressListener();
 
 // Initialize remote connection status listener (remote development)
 initRemoteStatusListener();
+initWorkspaceMirrorSync();
 
 export default function App() {
   const { t } = useI18n();
@@ -121,6 +124,7 @@ export default function App() {
 
   const repoState = useRepositoryState();
   const wtState = useWorktreeState();
+  useWorkspaceMirrorBridge(repoState, wtState);
   const settingsState = useSettingsState(
     wtState.activeTab,
     wtState.previousTab,
@@ -423,18 +427,20 @@ export default function App() {
     if (!selectedRepo) return;
     if (selectedRepo === TEMP_REPO_ID) return;
 
-    const oldWorktreePath = localStorage.getItem(STORAGE_KEYS.ACTIVE_WORKTREE);
-    const savedWorktreeMap = getStoredWorktreeMap();
-    const needsMigration = oldWorktreePath && !savedWorktreeMap[selectedRepo];
+    if (isLocalWorkspaceProjection()) {
+      const oldWorktreePath = localStorage.getItem(STORAGE_KEYS.ACTIVE_WORKTREE);
+      const savedWorktreeMap = getStoredWorktreeMap();
+      const needsMigration = oldWorktreePath && !savedWorktreeMap[selectedRepo];
 
-    if (needsMigration && oldWorktreePath) {
-      const migrated = {
-        ...savedWorktreeMap,
-        [selectedRepo]: oldWorktreePath,
-      };
-      localStorage.setItem(STORAGE_KEYS.ACTIVE_WORKTREES, JSON.stringify(migrated));
-      setRepoWorktreeMap(migrated);
-      localStorage.removeItem(STORAGE_KEYS.ACTIVE_WORKTREE);
+      if (needsMigration && oldWorktreePath) {
+        const migrated = {
+          ...savedWorktreeMap,
+          [selectedRepo]: oldWorktreePath,
+        };
+        localStorage.setItem(STORAGE_KEYS.ACTIVE_WORKTREES, JSON.stringify(migrated));
+        setRepoWorktreeMap(migrated);
+        localStorage.removeItem(STORAGE_KEYS.ACTIVE_WORKTREE);
+      }
     }
 
     if (!activeWorktree) {
@@ -453,7 +459,9 @@ export default function App() {
         if (!prev[selectedRepo]) return prev;
         const updated = { ...prev };
         delete updated[selectedRepo];
-        localStorage.setItem(STORAGE_KEYS.ACTIVE_WORKTREES, JSON.stringify(updated));
+        if (isLocalWorkspaceProjection()) {
+          localStorage.setItem(STORAGE_KEYS.ACTIVE_WORKTREES, JSON.stringify(updated));
+        }
         return updated;
       });
     }

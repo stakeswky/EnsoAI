@@ -32,6 +32,18 @@ function hasVisibleContent(data: string): boolean {
   return stripped.trim().length > 0;
 }
 
+function matchesTerminalSessionId(
+  eventId: string,
+  activeId: string | null,
+  requestedId: string | null
+): boolean {
+  return (
+    eventId === activeId ||
+    eventId === requestedId ||
+    (requestedId !== null && eventId === `remote:${requestedId}`)
+  );
+}
+
 export interface UseXtermOptions {
   cwd?: string;
   command?: {
@@ -53,6 +65,9 @@ export interface UseXtermOptions {
   onSplit?: () => void;
   onMerge?: () => void;
   canMerge?: boolean;
+  /** Stable scene-owned terminal ID used to attach after renderer/network reconnects. */
+  sessionId?: string;
+  persistent?: boolean;
 }
 
 export interface UseXtermResult {
@@ -131,6 +146,8 @@ export function useXterm({
   onSplit,
   onMerge,
   canMerge = false,
+  sessionId,
+  persistent = false,
 }: UseXtermOptions): UseXtermResult {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -146,6 +163,7 @@ export function useXterm({
   const ptyIdRef = useRef<string | null>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
   const exitCleanupRef = useRef<(() => void) | null>(null);
+  const streamResetCleanupRef = useRef<(() => void) | null>(null);
   const linkProviderDisposableRef = useRef<{ dispose: () => void } | null>(null);
   const rendererAddonRef = useRef<{ dispose: () => void } | null>(null);
   const copyOnSelectionHandlerRef = useRef<(() => void) | null>(null);
@@ -167,6 +185,8 @@ export function useXterm({
   onMergeRef.current = onMerge;
   const canMergeRef = useRef(canMerge);
   canMergeRef.current = canMerge;
+  const persistentRef = useRef(persistent || Boolean(sessionId));
+  persistentRef.current = persistent || Boolean(sessionId);
   const copyOnSelectionRef = useRef(copyOnSelection);
   copyOnSelectionRef.current = copyOnSelection;
   const hasBeenActivatedRef = useRef(false);
@@ -194,7 +214,7 @@ export function useXterm({
     }
   }, []);
 
-  const fit = useCallback(() => {
+  const fitTerminal = useCallback(() => {
     if (fitAddonRef.current && terminalRef.current && ptyIdRef.current) {
       fitAddonRef.current.fit();
       window.electronAPI.terminal.resize(ptyIdRef.current, {
@@ -586,21 +606,110 @@ export function useXterm({
       return true;
     });
 
+    const requestedSessionId = sessionId?.trim() || null;
+    if (requestedSessionId) {
+      ptyIdRef.current = requestedSessionId;
+    }
+
+    // Register stream listeners before attach so replay cannot race the renderer.
+    const cleanup = window.electronAPI.terminal.onData((event) => {
+      if (!matchesTerminalSessionId(event.id, ptyIdRef.current, requestedSessionId)) return;
+      writeBufferRef.current += event.data;
+
+      if (!isFlushPendingRef.current) {
+        isFlushPendingRef.current = true;
+        setTimeout(() => {
+          if (writeBufferRef.current.length > 0) {
+            const bufferedData = writeBufferRef.current;
+            const buffer = terminal.buffer.active;
+            const offsetFromBottom = buffer.baseY - buffer.viewportY;
+            const shouldLockViewport = offsetFromBottom > 0;
+            const savedOffsetFromBottom = shouldLockViewport ? offsetFromBottom : 0;
+
+            terminal.write(bufferedData);
+            if (shouldLockViewport) {
+              const targetViewportY = terminal.buffer.active.baseY - savedOffsetFromBottom;
+              const currentViewportY = terminal.buffer.active.viewportY;
+              if (targetViewportY !== currentViewportY) {
+                terminal.scrollLines(targetViewportY - currentViewportY);
+              }
+            }
+
+            if (!hasReceivedDataRef.current && hasVisibleContent(bufferedData)) {
+              hasReceivedDataRef.current = true;
+              setIsLoading(false);
+            }
+            onDataRef.current?.(bufferedData);
+            writeBufferRef.current = '';
+          }
+          isFlushPendingRef.current = false;
+        }, 30);
+      }
+    });
+    cleanupRef.current = cleanup;
+
+    const exitCleanup = window.electronAPI.terminal.onExit((event) => {
+      if (!matchesTerminalSessionId(event.id, ptyIdRef.current, requestedSessionId)) return;
+      setTimeout(() => {
+        if (writeBufferRef.current.length > 0) {
+          const bufferedData = writeBufferRef.current;
+          terminal.write(bufferedData);
+          onDataRef.current?.(bufferedData);
+          writeBufferRef.current = '';
+        }
+        onExitRef.current?.();
+      }, 30);
+    });
+    exitCleanupRef.current = exitCleanup;
+
+    const streamResetCleanup = window.electronAPI.terminal.onStreamReset((event) => {
+      if (!matchesTerminalSessionId(event.id, ptyIdRef.current, requestedSessionId)) return;
+      terminal.reset();
+      setIsLoading(true);
+    });
+    streamResetCleanupRef.current = streamResetCleanup;
+
     try {
       const createRequestId = ++createRequestIdRef.current;
-      const ptyId = await window.electronAPI.terminal.create({
+      const createOptions = {
         cwd: cwd || getEffectiveEnv().home,
-        // If command is provided (e.g., for agent), use shell/args directly
-        // Otherwise, use shellConfig from settings
         ...(command ? { shell: command.shell, args: command.args } : { shellConfig }),
         cols: terminal.cols,
         rows: terminal.rows,
         env,
         initialCommand: initialCommandRef.current,
-      });
+        ...(requestedSessionId
+          ? { sessionId: requestedSessionId, persistent: true }
+          : persistent
+            ? { persistent: true }
+            : {}),
+      };
+      let ptyId: string;
+      if (requestedSessionId) {
+        try {
+          const attached = await window.electronAPI.terminal.attach(requestedSessionId, {
+            afterStreamSeq: 0,
+          });
+          ptyId = attached.sessionId;
+        } catch {
+          ptyId = await window.electronAPI.terminal.create(createOptions);
+          const attached = await window.electronAPI.terminal.attach(ptyId, { afterStreamSeq: 0 });
+          ptyId = attached.sessionId;
+        }
+      } else {
+        ptyId = await window.electronAPI.terminal.create(createOptions);
+        if (persistent) {
+          const attached = await window.electronAPI.terminal.attach(ptyId, { afterStreamSeq: 0 });
+          ptyId = attached.sessionId;
+        }
+      }
 
       if (isUnmountedRef.current || createRequestId !== createRequestIdRef.current) {
-        await window.electronAPI.terminal.destroy(ptyId).catch(() => {});
+        if (persistent || requestedSessionId) {
+          await window.electronAPI.terminal.detach(ptyId).catch(() => {});
+        } else {
+          await window.electronAPI.terminal.destroy(ptyId).catch(() => {});
+        }
         return;
       }
 
@@ -608,74 +717,6 @@ export function useXterm({
 
       // Call onInit callback with ptyId
       onInitRef.current?.(ptyId);
-
-      // Handle data from pty with debounced buffering for smooth rendering
-      // 30ms delay merges fragmented TUI packets (clear + write)
-      const cleanup = window.electronAPI.terminal.onData((event) => {
-        if (event.id === ptyId) {
-          // Buffer data
-          writeBufferRef.current += event.data;
-
-          if (!isFlushPendingRef.current) {
-            isFlushPendingRef.current = true;
-            setTimeout(() => {
-              if (writeBufferRef.current.length > 0) {
-                const bufferedData = writeBufferRef.current;
-
-                // If user has scrolled up to view history, lock their viewport position.
-                // TUI control sequences (CSI 2J, CSI 3J, alternate buffer switch)
-                // can reset or scroll the viewport regardless of isUserScrolling.
-                // We preserve the user's scroll offset from the bottom.
-                const buffer = terminal.buffer.active;
-                const offsetFromBottom = buffer.baseY - buffer.viewportY;
-                const shouldLockViewport = offsetFromBottom > 0;
-                const savedOffsetFromBottom = shouldLockViewport ? offsetFromBottom : 0;
-
-                terminal.write(bufferedData);
-
-                // Restore viewport if it was moved by the write
-                if (shouldLockViewport) {
-                  const targetViewportY = terminal.buffer.active.baseY - savedOffsetFromBottom;
-                  const currentViewportY = terminal.buffer.active.viewportY;
-                  if (targetViewportY !== currentViewportY) {
-                    terminal.scrollLines(targetViewportY - currentViewportY);
-                  }
-                }
-
-                // Hide loading only after receiving visible content (not just control sequences)
-                if (!hasReceivedDataRef.current && hasVisibleContent(bufferedData)) {
-                  hasReceivedDataRef.current = true;
-                  setIsLoading(false);
-                }
-                // Call onData after write to avoid React re-render storm
-                onDataRef.current?.(bufferedData);
-                writeBufferRef.current = '';
-              }
-              isFlushPendingRef.current = false;
-            }, 30);
-          }
-        }
-      });
-      cleanupRef.current = cleanup;
-
-      // Handle exit - delay to ensure pending data events are received
-      // then flush remaining buffer before calling onExit
-      const exitCleanup = window.electronAPI.terminal.onExit((event) => {
-        if (event.id === ptyId) {
-          // Wait for any pending data events to arrive (IPC race condition)
-          setTimeout(() => {
-            // Flush any remaining buffered data
-            if (writeBufferRef.current.length > 0) {
-              const bufferedData = writeBufferRef.current;
-              terminal.write(bufferedData);
-              onDataRef.current?.(bufferedData);
-              writeBufferRef.current = '';
-            }
-            onExitRef.current?.();
-          }, 30);
-        }
-      });
-      exitCleanupRef.current = exitCleanup;
 
       // Handle input
       terminal.onData((data) => {
@@ -690,11 +731,14 @@ export function useXterm({
       if (isUnmountedRef.current) {
         return;
       }
+      cleanup();
+      exitCleanup();
+      streamResetCleanup();
       setIsLoading(false);
       terminal.writeln(`\x1b[31mFailed to start terminal.\x1b[0m`);
       terminal.writeln(`\x1b[33mError: ${error}\x1b[0m`);
     }
-  }, [cwd, command, shellConfig, commandKey, terminalRenderer]);
+  }, [cwd, command, shellConfig, commandKey, terminalRenderer, sessionId, persistent]);
 
   useEffect(() => {
     const shouldActivate = isActive || initialCommandRef.current;
@@ -729,8 +773,13 @@ export function useXterm({
       createRequestIdRef.current += 1;
       cleanupRef.current?.();
       exitCleanupRef.current?.();
+      streamResetCleanupRef.current?.();
       if (ptyIdRef.current) {
-        window.electronAPI.terminal.destroy(ptyIdRef.current);
+        if (persistentRef.current) {
+          window.electronAPI.terminal.detach(ptyIdRef.current).catch(() => {});
+        } else {
+          window.electronAPI.terminal.destroy(ptyIdRef.current);
+        }
         ptyIdRef.current = null;
       }
       // Remove copy-on-selection listener before disposing terminal
@@ -821,11 +870,11 @@ export function useXterm({
   useEffect(() => {
     if (isActive && terminalRef.current && !isLoading) {
       requestAnimationFrame(() => {
-        fit();
+        fitTerminal();
         terminalRef.current?.focus();
       });
     }
-  }, [isActive, isLoading, fit]);
+  }, [isActive, isLoading, fitTerminal]);
 
   // Handle window visibility change to refresh terminal rendering
   useEffect(() => {
@@ -843,7 +892,7 @@ export function useXterm({
           }
           terminalRef.current?.refresh(0, terminalRef.current.rows - 1);
           if (isActive) {
-            fit();
+            fitTerminal();
           }
         });
       }
@@ -851,7 +900,7 @@ export function useXterm({
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [isActive, fit]);
+  }, [isActive, fitTerminal]);
 
   // Handle app focus/blur events (macOS app switching)
   useEffect(() => {
@@ -860,7 +909,7 @@ export function useXterm({
         requestAnimationFrame(() => {
           terminalRef.current?.refresh(0, terminalRef.current.rows - 1);
           if (isActive) {
-            fit();
+            fitTerminal();
           }
         });
       }
@@ -868,7 +917,7 @@ export function useXterm({
 
     window.addEventListener('focus', handleFocus);
     return () => window.removeEventListener('focus', handleFocus);
-  }, [isActive, fit]);
+  }, [isActive, fitTerminal]);
 
   // Silent Reset: Proactively clear texture atlas every 30 mins to prevent long-term fragmentation
   useEffect(() => {
@@ -905,7 +954,7 @@ export function useXterm({
     isLoading,
     settings,
     write,
-    fit,
+    fit: fitTerminal,
     terminal: terminalRef.current,
     findNext,
     findPrevious,

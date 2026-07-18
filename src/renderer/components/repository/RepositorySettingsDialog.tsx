@@ -1,10 +1,12 @@
 import { CircleHelp } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import {
   DEFAULT_REPOSITORY_SETTINGS,
   getRepositorySettings,
+  getRepositorySettingsRevision,
   type RepositorySettings,
   saveRepositorySettings,
+  subscribeRepositorySettings,
 } from '@/App/storage';
 import { Button } from '@/components/ui/button';
 import {
@@ -21,6 +23,7 @@ import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip';
 import { useI18n } from '@/i18n';
+import { useWorkspaceMirrorStore } from '@/stores/workspaceMirror';
 
 interface RepositorySettingsDialogProps {
   open: boolean;
@@ -37,12 +40,22 @@ export function RepositorySettingsDialog({
 }: RepositorySettingsDialogProps) {
   const { t } = useI18n();
   const [settings, setSettings] = useState<RepositorySettings>(DEFAULT_REPOSITORY_SETTINGS);
+  const settingsRevision = useSyncExternalStore(
+    subscribeRepositorySettings,
+    getRepositorySettingsRevision
+  );
+  const canEdit = useWorkspaceMirrorStore(
+    (state) =>
+      state.projectionTarget !== 'transitioning' &&
+      (state.projectionTarget === 'local' || state.ownsControl)
+  );
 
   useEffect(() => {
+    void settingsRevision;
     if (open && repoPath) {
       setSettings(getRepositorySettings(repoPath));
     }
-  }, [open, repoPath]);
+  }, [open, repoPath, settingsRevision]);
 
   const handleSave = useCallback(() => {
     saveRepositorySettings(repoPath, settings);
@@ -84,6 +97,7 @@ export function RepositorySettingsDialog({
               <Switch
                 id="hidden-switch"
                 checked={settings.hidden}
+                disabled={!canEdit}
                 onCheckedChange={(checked) => setSettings((prev) => ({ ...prev, hidden: checked }))}
               />
             </div>
@@ -101,6 +115,7 @@ export function RepositorySettingsDialog({
               <Switch
                 id="auto-init-switch"
                 checked={settings.autoInitWorktree}
+                disabled={!canEdit}
                 onCheckedChange={(checked) =>
                   setSettings((prev) => ({ ...prev, autoInitWorktree: checked }))
                 }
@@ -116,6 +131,7 @@ export function RepositorySettingsDialog({
                   id="init-script"
                   placeholder={t('e.g., pnpm install && pnpm dev')}
                   value={settings.initScript}
+                  disabled={!canEdit}
                   onChange={(e) => setSettings((prev) => ({ ...prev, initScript: e.target.value }))}
                   className="min-h-24 font-mono text-sm"
                 />
@@ -131,7 +147,9 @@ export function RepositorySettingsDialog({
 
         <DialogFooter variant="bare">
           <DialogClose render={<Button variant="outline">{t('Cancel')}</Button>} />
-          <Button onClick={handleSave}>{t('Save')}</Button>
+          <Button onClick={handleSave} disabled={!canEdit}>
+            {t('Save')}
+          </Button>
         </DialogFooter>
       </DialogPopup>
     </Dialog>

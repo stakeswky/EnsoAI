@@ -103,8 +103,12 @@ export const IPC_CHANNELS = {
   TERMINAL_WRITE: 'terminal:write',
   TERMINAL_RESIZE: 'terminal:resize',
   TERMINAL_DESTROY: 'terminal:destroy',
+  TERMINAL_ATTACH: 'terminal:attach',
+  TERMINAL_DETACH: 'terminal:detach',
+  TERMINAL_LIST_PERSISTENT: 'terminal:listPersistent',
   TERMINAL_DATA: 'terminal:data',
   TERMINAL_EXIT: 'terminal:exit',
+  TERMINAL_STREAM_RESET: 'terminal:streamReset',
   TERMINAL_GET_ACTIVITY: 'terminal:getActivity',
 
   // Agent
@@ -287,6 +291,9 @@ export const IPC_CHANNELS = {
   REMOTE_HOST_STOP: 'remoteHost:stop',
   REMOTE_HOST_GET_STATUS: 'remoteHost:getStatus',
   REMOTE_HOST_REGENERATE_TOKEN: 'remoteHost:regenerateToken',
+  REMOTE_HOST_LIST_PAIRED_DEVICES: 'remoteHost:listPairedDevices',
+  REMOTE_HOST_REVOKE_PAIRED_DEVICE: 'remoteHost:revokePairedDevice',
+  REMOTE_HOST_SET_MIRROR_V2_ENABLED: 'remoteHost:setMirrorV2Enabled',
   REMOTE_HOST_STATUS_CHANGED: 'remoteHost:statusChanged',
 
   // Remote Client (this window attached to a remote host)
@@ -294,6 +301,20 @@ export const IPC_CHANNELS = {
   REMOTE_DISCONNECT: 'remote:disconnect',
   REMOTE_GET_STATUS: 'remote:getStatus',
   REMOTE_STATUS_CHANGED: 'remote:statusChanged',
+
+  // Authoritative workspace mirror (local renderer and remote renderer share this contract)
+  WORKSPACE_MIRROR_GET_SNAPSHOT: 'workspaceMirror:getSnapshot',
+  WORKSPACE_MIRROR_GET_BOOTSTRAP_STATUS: 'workspaceMirror:getBootstrapStatus',
+  WORKSPACE_MIRROR_DISPATCH_INTENT: 'workspaceMirror:dispatchIntent',
+  WORKSPACE_MIRROR_REQUEST_CONTROL: 'workspaceMirror:requestControl',
+  WORKSPACE_MIRROR_RELEASE_CONTROL: 'workspaceMirror:releaseControl',
+  WORKSPACE_MIRROR_STAGE_RESOURCE: 'workspaceMirror:stageResource',
+  WORKSPACE_MIRROR_MATERIALIZE_RESOURCE: 'workspaceMirror:materializeResource',
+  WORKSPACE_MIRROR_FETCH_RESOURCE: 'workspaceMirror:fetchResource',
+  WORKSPACE_MIRROR_COMPLETE_LEGACY_IMPORT: 'workspaceMirror:completeLegacyImport',
+  WORKSPACE_MIRROR_EVENT: 'workspaceMirror:event',
+  WORKSPACE_MIRROR_SNAPSHOT: 'workspaceMirror:snapshot',
+  WORKSPACE_MIRROR_CONTROL_CHANGED: 'workspaceMirror:controlChanged',
 
   // Logging
   LOG_UPDATE_CONFIG: 'log:update-config',
