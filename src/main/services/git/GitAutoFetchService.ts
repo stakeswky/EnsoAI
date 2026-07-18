@@ -2,6 +2,7 @@ import { existsSync, type FSWatcher, watch } from 'node:fs';
 import { join } from 'node:path';
 import { IPC_CHANNELS } from '@shared/types';
 import type { BrowserWindow } from 'electron';
+import { broadcastToRemoteClients } from '../remote/RemoteHostServer';
 import { GitService } from './GitService';
 
 const FETCH_INTERVAL_MS = 5 * 60 * 1000;
@@ -162,11 +163,13 @@ class GitAutoFetchService {
   }
 
   private notifyCompleted(): void {
+    const payload = { timestamp: Date.now() };
     if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-      this.mainWindow.webContents.send(IPC_CHANNELS.GIT_AUTO_FETCH_COMPLETED, {
-        timestamp: Date.now(),
-      });
+      this.mainWindow.webContents.send(IPC_CHANNELS.GIT_AUTO_FETCH_COMPLETED, payload);
     }
+    // Also notify attached remote dev clients (auto-fetch runs on the host
+    // for repos registered by remote windows).
+    broadcastToRemoteClients(IPC_CHANNELS.GIT_AUTO_FETCH_COMPLETED, payload);
   }
 
   /**

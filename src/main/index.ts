@@ -33,6 +33,7 @@ if (process.platform === 'darwin') {
 
 import {
   autoStartHapi,
+  autoStartRemoteHost,
   cleanupAllResources,
   cleanupAllResourcesSync,
   registerIpcHandlers,
@@ -52,6 +53,7 @@ import { checkGitInstalled } from './services/git/checkGit';
 import { gitAutoFetchService } from './services/git/GitAutoFetchService';
 import { setCurrentLocale } from './services/i18n';
 import { buildAppMenu } from './services/MenuBuilder';
+import { tryFetchRemoteFileResponse } from './services/remote/remoteFileFetch';
 import { webInspectorServer } from './services/webInspector';
 import log, { initLogger } from './utils/logger';
 import { destroyAgentTaskPanelWindow } from './windows/AgentTaskPanelWindow';
@@ -361,7 +363,7 @@ app.whenReady().then(async () => {
   await cleanupTempFiles();
 
   // Register protocol to handle local file:// URLs for markdown images
-  protocol.handle('local-file', (request) => {
+  protocol.handle('local-file', async (request) => {
     try {
       const filePath = customProtocolUriToPath(
         request.url,
@@ -370,6 +372,13 @@ app.whenReady().then(async () => {
       );
       if (!filePath) {
         return new Response('Bad Request', { status: 400 });
+      }
+
+      // When attached to a remote host, preview paths refer to host files:
+      // fetch bytes over the remote connection (falls through on failure).
+      const remoteResponse = await tryFetchRemoteFileResponse(filePath);
+      if (remoteResponse) {
+        return remoteResponse;
       }
 
       if (!isAllowedLocalFilePath(filePath)) {
@@ -480,6 +489,13 @@ app.whenReady().then(async () => {
         }
       } catch {
         // stat failed → file doesn't exist, will be caught below
+      }
+
+      // When attached to a remote host, serve media bytes from the host
+      // (full-body response; no Range support for remote video).
+      const remoteMediaResponse = await tryFetchRemoteFileResponse(filePath);
+      if (remoteMediaResponse) {
+        return remoteMediaResponse;
       }
 
       // Video files: stream with Range request support for <video> element
@@ -660,6 +676,9 @@ app.whenReady().then(async () => {
 
   // Auto-start Hapi server if enabled in settings
   await autoStartHapi();
+
+  // Auto-start remote dev host server if enabled in settings
+  await autoStartRemoteHost();
 
   setCurrentLocale(readStoredLanguage());
 

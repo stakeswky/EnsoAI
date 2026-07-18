@@ -35,6 +35,10 @@ import type {
   ProxySettings,
   PullRequest,
   RecentEditorProject,
+  RemoteClientStatus,
+  RemoteConnectOptions,
+  RemoteHostSettings,
+  RemoteHostStatus,
   ShellConfig,
   ShellInfo,
   TempWorkspaceCheckResult,
@@ -612,6 +616,37 @@ const electronAPI = {
     HOME: process.env.HOME || process.env.USERPROFILE || '',
     platform: process.platform as 'darwin' | 'win32' | 'linux',
     appVersion: pkg.version,
+  },
+
+  // Remote host (this instance serving as a remote dev host)
+  remoteHost: {
+    start: (
+      config?: Partial<Pick<RemoteHostSettings, 'port' | 'bind'>>
+    ): Promise<RemoteHostStatus> => ipcRenderer.invoke(IPC_CHANNELS.REMOTE_HOST_START, config),
+    stop: (): Promise<RemoteHostStatus> => ipcRenderer.invoke(IPC_CHANNELS.REMOTE_HOST_STOP),
+    getStatus: (): Promise<RemoteHostStatus> =>
+      ipcRenderer.invoke(IPC_CHANNELS.REMOTE_HOST_GET_STATUS),
+    regenerateToken: (): Promise<RemoteHostStatus> =>
+      ipcRenderer.invoke(IPC_CHANNELS.REMOTE_HOST_REGENERATE_TOKEN),
+    onStatusChanged: (callback: (status: RemoteHostStatus) => void): (() => void) => {
+      const handler = (_: unknown, status: RemoteHostStatus) => callback(status);
+      ipcRenderer.on(IPC_CHANNELS.REMOTE_HOST_STATUS_CHANGED, handler);
+      return () => ipcRenderer.off(IPC_CHANNELS.REMOTE_HOST_STATUS_CHANGED, handler);
+    },
+  },
+
+  // Remote client (this window attached to a remote host)
+  remote: {
+    connect: (options: RemoteConnectOptions): Promise<RemoteClientStatus> =>
+      ipcRenderer.invoke(IPC_CHANNELS.REMOTE_CONNECT, options),
+    disconnect: (): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.REMOTE_DISCONNECT),
+    getStatus: (): Promise<RemoteClientStatus> =>
+      ipcRenderer.invoke(IPC_CHANNELS.REMOTE_GET_STATUS),
+    onStatusChanged: (callback: (status: RemoteClientStatus) => void): (() => void) => {
+      const handler = (_: unknown, status: RemoteClientStatus) => callback(status);
+      ipcRenderer.on(IPC_CHANNELS.REMOTE_STATUS_CHANGED, handler);
+      return () => ipcRenderer.off(IPC_CHANNELS.REMOTE_STATUS_CHANGED, handler);
+    },
   },
 
   // Shell

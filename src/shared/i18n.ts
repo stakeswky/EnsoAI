@@ -1056,6 +1056,32 @@ export const zhTranslations: Record<string, string> = {
   'Select a result to preview': '选择结果以预览',
   'Unable to load file': '无法加载文件',
   'Use .gitignore': '使用 .gitignore',
+  // Remote Development
+  'Remote Development': '远程开发',
+  'Develop across machines on your Tailscale network': '在 Tailscale 网络中的机器间远程开发',
+  'Host Mode': '主机模式',
+  'Allow other devices to connect to this machine': '允许其他设备连接到本机',
+  'Connected clients: {{count}}': '已连接客户端:{{count}}',
+  'Tailscale network not detected; server is only reachable from this machine':
+    '未检测到 Tailscale 网络,服务仅本机可访问',
+  'Pairing Token': '配对 Token',
+  'Regenerate token (disconnects all clients)': '重新生成 Token(将断开所有客户端)',
+  'Connect to Host': '连接到主机',
+  'Run terminals and agents on another machine': '在另一台机器上运行终端与 Agent',
+  'Connected to {{hostname}}': '已连接到 {{hostname}}',
+  'Reconnecting...': '重连中…',
+  'New terminals and agent sessions now run on the remote host':
+    '新建的终端与 Agent 会话将运行在远程主机上',
+  'Host Address': '主机地址',
+  'Paste the token shown on the host': '粘贴主机设置页中显示的 Token',
+  Connect: '连接',
+  'Connecting...': '连接中…',
+  Disconnect: '断开连接',
+  'Select a folder on the remote host': '选择远程主机上的文件夹',
+  'Parent directory': '上级目录',
+  'No subfolders': '没有子文件夹',
+  'Select this folder': '选择此文件夹',
+
   // Hapi Remote Sharing
   'Hapi Agents': 'Hapi Agent',
   'Agents available through remote sharing': '可通过远程共享使用的代理',

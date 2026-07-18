@@ -1,5 +1,6 @@
 import type { TerminalCreateOptions } from '@shared/types';
 import { useCallback, useEffect } from 'react';
+import { getEffectiveEnv } from '@/stores/remote';
 import { useSettingsStore } from '@/stores/settings';
 import { useTerminalStore } from '@/stores/terminal';
 
@@ -26,7 +27,7 @@ export function useTerminal() {
       addSession({
         id,
         title: 'Terminal',
-        cwd: options?.cwd || window.electronAPI.env.HOME || '/',
+        cwd: options?.cwd || getEffectiveEnv().home || '/',
       });
       return id;
     },

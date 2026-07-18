@@ -282,6 +282,19 @@ export const IPC_CHANNELS = {
   AGENT_TASK_PANEL_RESET_BOUNDS: 'agent-task:panel:resetBounds',
   AGENT_TASK_SYNC: 'agent-task:sync',
 
+  // Remote Host (this instance acting as a remote dev host)
+  REMOTE_HOST_START: 'remoteHost:start',
+  REMOTE_HOST_STOP: 'remoteHost:stop',
+  REMOTE_HOST_GET_STATUS: 'remoteHost:getStatus',
+  REMOTE_HOST_REGENERATE_TOKEN: 'remoteHost:regenerateToken',
+  REMOTE_HOST_STATUS_CHANGED: 'remoteHost:statusChanged',
+
+  // Remote Client (this window attached to a remote host)
+  REMOTE_CONNECT: 'remote:connect',
+  REMOTE_DISCONNECT: 'remote:disconnect',
+  REMOTE_GET_STATUS: 'remote:getStatus',
+  REMOTE_STATUS_CHANGED: 'remote:statusChanged',
+
   // Logging
   LOG_UPDATE_CONFIG: 'log:update-config',
   LOG_OPEN_FOLDER: 'log:open-folder',

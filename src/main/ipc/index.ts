@@ -1,5 +1,6 @@
 import { stopAllCodeReviews } from '../services/ai';
 import { disposeClaudeIdeBridge } from '../services/claude/ClaudeIdeBridge';
+import { installIpcInterceptor } from '../services/remote/handlerRegistry';
 import { autoUpdaterService } from '../services/updater/AutoUpdater';
 import { webInspectorServer } from '../services/webInspector';
 import { cleanupExecInPtys, cleanupExecInPtysSync } from '../utils/shell';
@@ -27,6 +28,15 @@ export { autoStartHapi };
 
 import { registerLogHandlers } from './log';
 import { registerNotificationHandlers } from './notification';
+import {
+  autoStartRemoteHost,
+  cleanupRemote,
+  cleanupRemoteSync,
+  registerRemoteHandlers,
+} from './remote';
+
+export { autoStartRemoteHost };
+
 import { registerSearchHandlers } from './search';
 import { registerSettingsHandlers } from './settings';
 import { registerShellHandlers } from './shell';
@@ -43,6 +53,10 @@ import { registerWebInspectorHandlers } from './webInspector';
 import { clearAllWorktreeServices, registerWorktreeHandlers } from './worktree';
 
 export function registerIpcHandlers(): void {
+  // Must run before any handler registration: records handlers into the
+  // remote registry and wraps whitelisted channels for remote forwarding.
+  installIpcInterceptor();
+
   registerGitHandlers();
   registerWorktreeHandlers();
   registerFileHandlers();
@@ -65,6 +79,7 @@ export function registerIpcHandlers(): void {
   registerTempWorkspaceHandlers();
   registerTmuxHandlers();
   registerTodoHandlers();
+  registerRemoteHandlers();
 }
 
 export async function cleanupAllResources(): Promise<void> {
@@ -106,6 +121,8 @@ export async function cleanupAllResources(): Promise<void> {
       safeRun(() => stopClaudeCompletionsWatchers(), 'claudeCompletions'),
       // Temp files
       safeRun(() => cleanupTempFiles(), 'tempFiles'),
+      // Remote host server + client connections
+      safeRun(() => cleanupRemote(), 'remote'),
     ]),
     deadline,
   ]);
@@ -144,6 +161,9 @@ export function cleanupAllResourcesSync(): void {
 
   // Stop Web Inspector server (sync)
   webInspectorServer.stop();
+
+  // Stop remote host server + client connections (sync)
+  cleanupRemoteSync();
 
   // Kill all PTY sessions immediately (sync)
   destroyAllTerminals();

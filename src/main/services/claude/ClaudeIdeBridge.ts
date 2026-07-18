@@ -6,6 +6,7 @@ import * as path from 'node:path';
 import { IPC_CHANNELS } from '@shared/types';
 import { BrowserWindow, ipcMain } from 'electron';
 import { type RawData, type WebSocket, WebSocketServer } from 'ws';
+import { broadcastToRemoteClients } from '../remote/RemoteHostServer';
 import {
   ensurePermissionRequestHook,
   ensurePostToolUseHook,
@@ -144,6 +145,19 @@ function safeJsonParse(s: string): JsonRpcRequest | null {
   }
 }
 
+/**
+ * Send an agent event to all windows AND to attached remote dev clients
+ * (remote clients are not part of BrowserWindow.getAllWindows()).
+ */
+function broadcastAgentEvent(channel: string, payload: unknown): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send(channel, payload);
+    }
+  }
+  broadcastToRemoteClients(channel, payload);
+}
+
 function createJsonRpcHandler({ ideName }: { ideName: string }) {
   let initialized = false;
 
@@ -228,11 +242,7 @@ export async function startClaudeIdeBridge(
   let statusUpdateFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   function sendStatusUpdateToWindows(update: AgentStatusUpdatePayload): void {
-    for (const window of BrowserWindow.getAllWindows()) {
-      if (!window.isDestroyed()) {
-        window.webContents.send(IPC_CHANNELS.AGENT_STATUS_UPDATE, update);
-      }
-    }
+    broadcastAgentEvent(IPC_CHANNELS.AGENT_STATUS_UPDATE, update);
   }
 
   function flushPendingStatusUpdates(): void {
@@ -314,20 +324,16 @@ export async function startClaudeIdeBridge(
               console.log(
                 `[ClaudeIdeBridge] → running (UserPromptSubmit) at ${data.cwd?.split('/').slice(-2).join('/')}`
               );
-              for (const window of BrowserWindow.getAllWindows()) {
-                if (!window.isDestroyed()) {
-                  window.webContents.send(IPC_CHANNELS.AGENT_PRE_TOOL_USE_NOTIFICATION, {
-                    sessionId,
-                    toolName: 'UserPromptSubmit',
-                    cwd: data.cwd,
-                  });
-                  window.webContents.send(IPC_CHANNELS.AGENT_USER_PROMPT_NOTIFICATION, {
-                    sessionId,
-                    prompt: data.prompt,
-                    cwd: data.cwd,
-                  });
-                }
-              }
+              broadcastAgentEvent(IPC_CHANNELS.AGENT_PRE_TOOL_USE_NOTIFICATION, {
+                sessionId,
+                toolName: 'UserPromptSubmit',
+                cwd: data.cwd,
+              });
+              broadcastAgentEvent(IPC_CHANNELS.AGENT_USER_PROMPT_NOTIFICATION, {
+                sessionId,
+                prompt: data.prompt,
+                cwd: data.cwd,
+              });
             } else if (
               data.tool_name === 'AskUserQuestion' &&
               data.tool_input &&
@@ -340,15 +346,11 @@ export async function startClaudeIdeBridge(
               console.log(
                 `[ClaudeIdeBridge] → waiting_input (AskUserQuestion) at ${data.cwd?.split('/').slice(-2).join('/')}`
               );
-              for (const window of BrowserWindow.getAllWindows()) {
-                if (!window.isDestroyed()) {
-                  window.webContents.send(IPC_CHANNELS.AGENT_ASK_USER_QUESTION_NOTIFICATION, {
-                    sessionId,
-                    toolInput: data.tool_input,
-                    cwd: data.cwd, // Pass cwd for fallback session creation
-                  });
-                }
-              }
+              broadcastAgentEvent(IPC_CHANNELS.AGENT_ASK_USER_QUESTION_NOTIFICATION, {
+                sessionId,
+                toolInput: data.tool_input,
+                cwd: data.cwd, // Pass cwd for fallback session creation
+              });
             } else if (
               data.hook_event_name === 'PostToolUse' &&
               data.tool_name === 'AskUserQuestion' &&
@@ -358,15 +360,11 @@ export async function startClaudeIdeBridge(
               console.log(
                 `[ClaudeIdeBridge] → running (PostToolUse/AskUserQuestion) at ${data.cwd?.split('/').slice(-2).join('/')}`
               );
-              for (const window of BrowserWindow.getAllWindows()) {
-                if (!window.isDestroyed()) {
-                  window.webContents.send(IPC_CHANNELS.AGENT_PRE_TOOL_USE_NOTIFICATION, {
-                    sessionId,
-                    toolName: data.tool_name,
-                    cwd: data.cwd,
-                  });
-                }
-              }
+              broadcastAgentEvent(IPC_CHANNELS.AGENT_PRE_TOOL_USE_NOTIFICATION, {
+                sessionId,
+                toolName: data.tool_name,
+                cwd: data.cwd,
+              });
             } else if (data.hook_event_name === 'PermissionRequest') {
               // PermissionRequest event - Claude Code asking for permission approval
               // Note: AskUserQuestion is already handled above, so exclude it here to avoid duplicate notifications
@@ -379,15 +377,11 @@ export async function startClaudeIdeBridge(
                 console.log(
                   `[ClaudeIdeBridge] → waiting_input (${data.tool_name} permission) at ${data.cwd?.split('/').slice(-2).join('/')}`
                 );
-                for (const window of BrowserWindow.getAllWindows()) {
-                  if (!window.isDestroyed()) {
-                    window.webContents.send(IPC_CHANNELS.AGENT_ASK_USER_QUESTION_NOTIFICATION, {
-                      sessionId,
-                      toolInput: data.tool_input,
-                      cwd: data.cwd,
-                    });
-                  }
-                }
+                broadcastAgentEvent(IPC_CHANNELS.AGENT_ASK_USER_QUESTION_NOTIFICATION, {
+                  sessionId,
+                  toolInput: data.tool_input,
+                  cwd: data.cwd,
+                });
               }
               // Don't log skipped PermissionRequest for read-only tools - too noisy
             } else if (data.hook_event_name === 'Stop') {
@@ -415,15 +409,11 @@ export async function startClaudeIdeBridge(
                 }
               }
 
-              for (const window of BrowserWindow.getAllWindows()) {
-                if (!window.isDestroyed()) {
-                  window.webContents.send(IPC_CHANNELS.AGENT_STOP_NOTIFICATION, {
-                    sessionId,
-                    cwd: data.cwd,
-                    taskCompletionStatus,
-                  });
-                }
-              }
+              broadcastAgentEvent(IPC_CHANNELS.AGENT_STOP_NOTIFICATION, {
+                sessionId,
+                cwd: data.cwd,
+                taskCompletionStatus,
+              });
             }
             // Note: PreToolUse and Notification hooks are intentionally not logged here
             // They don't require state changes and logging them creates noise

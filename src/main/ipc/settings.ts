@@ -76,6 +76,17 @@ export function flushSettings(): boolean {
   return true;
 }
 
+/**
+ * Update top-level settings keys from the main process (immediate atomic write).
+ * Used by features whose config is owned by the main process (e.g. remote host).
+ */
+export function updateSettingsFromMain(patch: Record<string, unknown>): void {
+  const current = readSettings() ?? {};
+  cachedSettings = { ...current, ...patch };
+  isDirty = false;
+  atomicWriteSettings(cachedSettings);
+}
+
 export function registerSettingsHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.SETTINGS_READ, async () => {
     return readSettings();

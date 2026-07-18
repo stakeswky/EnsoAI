@@ -4,6 +4,7 @@ import { matchSorter } from 'match-sorter';
 import * as React from 'react';
 import type { RepositoryGroup } from '@/App/constants';
 import { CreateGroupDialog } from '@/components/group';
+import { RemoteDirectoryPicker } from '@/components/remote/RemoteDirectoryPicker';
 import {
   Autocomplete,
   AutocompleteEmpty,
@@ -40,6 +41,7 @@ import { useI18n } from '@/i18n';
 import { generateClonePath } from '@/lib/gitClone';
 import { Z_INDEX } from '@/lib/z-index';
 import { useCloneTasksStore } from '@/stores/cloneTasks';
+import { useEffectiveEnv, useRemoteAttached } from '@/stores/remote';
 import { useSettingsStore } from '@/stores/settings';
 
 type AddMode = 'local' | 'remote';
@@ -243,16 +245,30 @@ export function AddRepositoryDialog({
     return results.length > 0;
   }, []);
 
+  // Remote development: browse the host's filesystem instead of the local one
+  const remoteAttached = useRemoteAttached();
+  const effectiveEnv = useEffectiveEnv();
+  const [remotePickerTarget, setRemotePickerTarget] = React.useState<'local' | 'target' | null>(
+    null
+  );
+
   // Format path for display - replace home directory with ~
-  const formatPathDisplay = React.useCallback((fullPath: string) => {
-    const home = window.electronAPI.env.HOME;
-    if (home && fullPath.startsWith(home)) {
-      return `~${fullPath.slice(home.length)}`;
-    }
-    return fullPath;
-  }, []);
+  const formatPathDisplay = React.useCallback(
+    (fullPath: string) => {
+      const home = effectiveEnv.home;
+      if (home && fullPath.startsWith(home)) {
+        return `~${fullPath.slice(home.length)}`;
+      }
+      return fullPath;
+    },
+    [effectiveEnv.home]
+  );
 
   const handleSelectLocalPath = async () => {
+    if (remoteAttached) {
+      setRemotePickerTarget('local');
+      return;
+    }
     try {
       const selectedPath = await window.electronAPI.dialog.openDirectory();
       if (selectedPath) {
@@ -265,6 +281,10 @@ export function AddRepositoryDialog({
   };
 
   const handleSelectTargetDir = async () => {
+    if (remoteAttached) {
+      setRemotePickerTarget('target');
+      return;
+    }
     try {
       const selectedPath = await window.electronAPI.dialog.openDirectory();
       if (selectedPath) {
@@ -275,6 +295,16 @@ export function AddRepositoryDialog({
     } catch (err) {
       setError(err instanceof Error ? err.message : t('Failed to select directory'));
     }
+  };
+
+  const handleRemotePickerSelect = (selectedPath: string) => {
+    if (remotePickerTarget === 'local') {
+      setLocalPath(selectedPath);
+    } else if (remotePickerTarget === 'target') {
+      setTargetDir(selectedPath);
+      targetDirUserModifiedRef.current = true;
+    }
+    setError(null);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -310,9 +340,7 @@ export function AddRepositoryDialog({
         return;
       }
 
-      const isWindows = window.electronAPI.env.platform === 'win32';
-      const pathSep = isWindows ? '\\' : '/';
-      const fullPath = `${targetDir}${pathSep}${repoName.trim()}`;
+      const fullPath = `${targetDir}${effectiveEnv.pathSep}${repoName.trim()}`;
 
       // Create a task in the store for background tracking
       const taskId = addCloneTask({
@@ -678,7 +706,7 @@ export function AddRepositoryDialog({
                     <span className="font-medium">{t('Full path')}:</span>
                     <code className="ml-1 break-all">
                       {targetDir}
-                      {window.electronAPI.env.platform === 'win32' ? '\\' : '/'}
+                      {effectiveEnv.pathSep}
                       {repoName}
                     </code>
                   </div>
@@ -719,6 +747,17 @@ export function AddRepositoryDialog({
         open={createGroupDialogOpen}
         onOpenChange={setCreateGroupDialogOpen}
         onSubmit={handleCreateGroup}
+      />
+
+      <RemoteDirectoryPicker
+        open={remotePickerTarget !== null}
+        onOpenChange={(pickerOpen) => {
+          if (!pickerOpen) setRemotePickerTarget(null);
+        }}
+        onSelect={handleRemotePickerSelect}
+        initialPath={
+          remotePickerTarget === 'local' ? localPath || undefined : targetDir || undefined
+        }
       />
     </Dialog>
   );

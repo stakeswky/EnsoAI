@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { defaultDarkTheme, getXtermTheme } from '@/lib/ghosttyTheme';
 import { matchesKeybinding } from '@/lib/keybinding';
 import { useNavigationStore } from '@/stores/navigation';
+import { getEffectiveEnv } from '@/stores/remote';
 import { useSettingsStore } from '@/stores/settings';
 import '@xterm/xterm/css/xterm.css';
 
@@ -588,7 +589,7 @@ export function useXterm({
     try {
       const createRequestId = ++createRequestIdRef.current;
       const ptyId = await window.electronAPI.terminal.create({
-        cwd: cwd || window.electronAPI.env.HOME,
+        cwd: cwd || getEffectiveEnv().home,
         // If command is provided (e.g., for agent), use shell/args directly
         // Otherwise, use shellConfig from settings
         ...(command ? { shell: command.shell, args: command.args } : { shellConfig }),

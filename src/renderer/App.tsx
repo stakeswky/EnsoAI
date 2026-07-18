@@ -91,6 +91,7 @@ import { initAgentTasksListener, useAgentTasksStore } from './stores/agentTasks'
 import { initCloneProgressListener } from './stores/cloneTasks';
 import { useEditorStore } from './stores/editor';
 import { useInitScriptStore } from './stores/initScript';
+import { initRemoteStatusListener, useEffectiveEnv } from './stores/remote';
 import { useSettingsStore } from './stores/settings';
 import { useTempWorkspaceStore } from './stores/tempWorkspace';
 import { useWorktreeStore } from './stores/worktree';
@@ -98,6 +99,9 @@ import { initAgentActivityListener, useWorktreeActivityStore } from './stores/wo
 
 // Initialize global clone progress listener
 initCloneProgressListener();
+
+// Initialize remote connection status listener (remote development)
+initRemoteStatusListener();
 
 export default function App() {
   const { t } = useI18n();
@@ -249,9 +253,10 @@ export default function App() {
   const fileTreeDisplayMode = useSettingsStore((s) => s.fileTreeDisplayMode);
   const hasActiveWorktree = Boolean(activeWorktree?.path);
   const defaultTemporaryPath = useSettingsStore((s) => s.defaultTemporaryPath);
-  const isWindows = window.electronAPI?.env.platform === 'win32';
-  const pathSep = isWindows ? '\\' : '/';
-  const homeDir = window.electronAPI?.env.HOME || '';
+  // Environment of the machine terminals/files run on (remote host while attached)
+  const effectiveEnv = useEffectiveEnv();
+  const pathSep = effectiveEnv.pathSep;
+  const homeDir = effectiveEnv.home || '';
   const effectiveTempBasePath = useMemo(
     () => defaultTemporaryPath || [homeDir, 'ensoai', 'temporary'].join(pathSep),
     [defaultTemporaryPath, homeDir, pathSep]
