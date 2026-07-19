@@ -1,4 +1,4 @@
-import type { RemoteClientStatus } from '@shared/types';
+import type { ControllerLease, RemoteClientStatus, RemoteHostInfo } from '@shared/types';
 import { create } from 'zustand';
 
 interface RemoteState {
@@ -8,8 +8,64 @@ interface RemoteState {
 
 export const useRemoteStore = create<RemoteState>()((set) => ({
   status: null,
-  setStatus: (status) => set({ status }),
+  setStatus: (status) =>
+    set((state) => (areRemoteClientStatusesEqual(state.status, status) ? state : { status })),
 }));
+
+function areRemoteHostInfosEqual(
+  left: RemoteHostInfo | null,
+  right: RemoteHostInfo | null
+): boolean {
+  return (
+    left === right ||
+    (left !== null &&
+      right !== null &&
+      left.platform === right.platform &&
+      left.home === right.home &&
+      left.hostname === right.hostname &&
+      left.appVersion === right.appVersion)
+  );
+}
+
+function areControllerLeasesEqual(
+  left: ControllerLease | null | undefined,
+  right: ControllerLease | null | undefined
+): boolean {
+  return (
+    left === right ||
+    (left != null &&
+      right != null &&
+      left.leaseId === right.leaseId &&
+      left.holderDeviceId === right.holderDeviceId &&
+      left.holderClientId === right.holderClientId &&
+      left.acquiredAt === right.acquiredAt &&
+      left.expiresAt === right.expiresAt &&
+      left.graceUntil === right.graceUntil &&
+      left.coordSeq === right.coordSeq)
+  );
+}
+
+export function areRemoteClientStatusesEqual(
+  left: RemoteClientStatus | null,
+  right: RemoteClientStatus | null
+): boolean {
+  return (
+    left === right ||
+    (left !== null &&
+      right !== null &&
+      left.state === right.state &&
+      left.host === right.host &&
+      left.port === right.port &&
+      areRemoteHostInfosEqual(left.hostInfo, right.hostInfo) &&
+      left.mirrorSyncPhase === right.mirrorSyncPhase &&
+      left.mirrorRevision === right.mirrorRevision &&
+      left.mirrorProtocol === right.mirrorProtocol &&
+      areControllerLeasesEqual(left.mirrorController, right.mirrorController) &&
+      left.mirrorOwnsControl === right.mirrorOwnsControl &&
+      left.mirrorLastResyncReason === right.mirrorLastResyncReason &&
+      left.error === right.error)
+  );
+}
 
 /** Whether this window is attached to a remote host (incl. reconnecting) */
 export function isRemoteAttached(status: RemoteClientStatus | null): boolean {

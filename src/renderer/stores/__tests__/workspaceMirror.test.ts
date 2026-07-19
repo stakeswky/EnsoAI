@@ -1,10 +1,12 @@
 import { createEmptyWorkspaceSceneSnapshot } from '@shared/types';
 import { describe, expect, it, vi } from 'vitest';
+import { useRemoteStore } from '../remote';
 import {
   applyWorkspaceSceneEvent,
   canMutateWorkspaceProjection,
   canQueryWorkspaceResources,
   getWorkspaceQueryScope,
+  reconcileWorkspaceMirrorRemoteStatus,
   useWorkspaceMirrorStore,
 } from '../workspaceMirror';
 
@@ -142,5 +144,276 @@ describe('workspace mirror renderer projection', () => {
     expect(getWorkspaceQueryScope('transitioning', snapshot)).toBe('transitioning');
     expect(getWorkspaceQueryScope('local', snapshot)).toBe('local:host-1:scene-1');
     expect(getWorkspaceQueryScope('remote', snapshot)).toBe('remote:host-1:scene-1');
+  });
+
+  it('keeps a live remote projection stable across lease-only status updates', () => {
+    const snapshot = createEmptyWorkspaceSceneSnapshot(identity);
+    const lease = {
+      leaseId: 'lease-2',
+      holderDeviceId: 'device-2',
+      holderClientId: 'client-2',
+      acquiredAt: 2,
+      expiresAt: 60_002,
+      graceUntil: null,
+      coordSeq: 2,
+    };
+    const reconciliation = reconcileWorkspaceMirrorRemoteStatus(
+      {
+        snapshot,
+        snapshotTarget: 'remote',
+        syncPhase: 'live',
+        projectionTarget: 'remote',
+        controllerLease: null,
+        ownsControl: false,
+      },
+      {
+        state: 'connected',
+        host: '100.64.0.2',
+        port: 48925,
+        hostInfo: null,
+        mirrorProtocol: 'v2',
+        mirrorSyncPhase: 'live',
+        mirrorRevision: 12,
+        mirrorController: lease,
+        mirrorOwnsControl: false,
+      }
+    );
+
+    expect(reconciliation).toEqual({
+      patch: { controllerLease: lease },
+      refreshProjection: false,
+    });
+  });
+
+  it('uses remote status ownership directly across revoked and granted frames', () => {
+    const snapshot = createEmptyWorkspaceSceneSnapshot(identity);
+    const current = {
+      snapshot,
+      snapshotTarget: 'remote' as const,
+      syncPhase: 'live' as const,
+      projectionTarget: 'remote' as const,
+      controllerLease: {
+        leaseId: 'lease-old',
+        holderDeviceId: 'device-1',
+        holderClientId: 'client-1',
+        acquiredAt: 1,
+        expiresAt: 60_000,
+        graceUntil: null,
+        coordSeq: 1,
+      },
+      ownsControl: true,
+    };
+    const revoked = reconcileWorkspaceMirrorRemoteStatus(current, {
+      state: 'connected',
+      host: '100.64.0.2',
+      port: 48925,
+      hostInfo: null,
+      mirrorProtocol: 'v2',
+      mirrorSyncPhase: 'live',
+      mirrorRevision: 12,
+      mirrorController: null,
+      mirrorOwnsControl: false,
+    });
+    expect(revoked.patch).toEqual({ controllerLease: null, ownsControl: false });
+    expect(revoked.refreshProjection).toBe(false);
+
+    const nextLease = { ...current.controllerLease, leaseId: 'lease-new', coordSeq: 3 };
+    const granted = reconcileWorkspaceMirrorRemoteStatus(
+      { ...current, controllerLease: null, ownsControl: false },
+      {
+        state: 'connected',
+        host: '100.64.0.2',
+        port: 48925,
+        hostInfo: null,
+        mirrorProtocol: 'v2',
+        mirrorSyncPhase: 'live',
+        mirrorRevision: 12,
+        mirrorController: nextLease,
+        mirrorOwnsControl: true,
+      }
+    );
+    expect(granted.patch).toEqual({ controllerLease: nextLease, ownsControl: true });
+    expect(granted.refreshProjection).toBe(false);
+  });
+
+  it('enters transitioning only for an actual connect, disconnect, or resync boundary', () => {
+    const snapshot = createEmptyWorkspaceSceneSnapshot(identity);
+    const remoteState = {
+      snapshot,
+      snapshotTarget: 'remote' as const,
+      syncPhase: 'live' as const,
+      projectionTarget: 'remote' as const,
+      controllerLease: null,
+      ownsControl: false,
+    };
+    const resync = reconcileWorkspaceMirrorRemoteStatus(remoteState, {
+      state: 'connected',
+      host: '100.64.0.2',
+      port: 48925,
+      hostInfo: null,
+      mirrorProtocol: 'v2',
+      mirrorSyncPhase: 'resyncing',
+      mirrorOwnsControl: false,
+    });
+    expect(resync).toEqual({
+      patch: { projectionTarget: 'transitioning', syncPhase: 'resyncing' },
+      refreshProjection: false,
+    });
+
+    const disconnect = reconcileWorkspaceMirrorRemoteStatus(remoteState, {
+      state: 'disconnected',
+      host: null,
+      port: null,
+      hostInfo: null,
+    });
+    expect(disconnect).toEqual({
+      patch: { projectionTarget: 'transitioning' },
+      refreshProjection: true,
+    });
+  });
+
+  it('returns to the remote projection after an empty replay reaches live', () => {
+    const snapshot = createEmptyWorkspaceSceneSnapshot(identity);
+    const reconciliation = reconcileWorkspaceMirrorRemoteStatus(
+      {
+        snapshot,
+        snapshotTarget: 'remote',
+        syncPhase: 'resyncing',
+        projectionTarget: 'transitioning',
+        controllerLease: null,
+        ownsControl: false,
+      },
+      {
+        state: 'connected',
+        host: '100.64.0.2',
+        port: 48925,
+        hostInfo: null,
+        mirrorProtocol: 'v2',
+        mirrorSyncPhase: 'live',
+        mirrorRevision: snapshot.revision,
+        mirrorController: null,
+        mirrorOwnsControl: false,
+      }
+    );
+
+    expect(reconciliation).toEqual({
+      patch: { projectionTarget: 'remote', syncPhase: 'live' },
+      refreshProjection: false,
+    });
+  });
+
+  it('fails closed while reconnecting even if transport status contains a stale lease', () => {
+    const snapshot = createEmptyWorkspaceSceneSnapshot(identity);
+    const staleLease = {
+      leaseId: 'lease-stale',
+      holderDeviceId: 'device-1',
+      holderClientId: 'client-1',
+      acquiredAt: 1,
+      expiresAt: 60_000,
+      graceUntil: null,
+      coordSeq: 1,
+    };
+    const reconciliation = reconcileWorkspaceMirrorRemoteStatus(
+      {
+        snapshot,
+        snapshotTarget: 'remote',
+        syncPhase: 'live',
+        projectionTarget: 'remote',
+        controllerLease: staleLease,
+        ownsControl: true,
+      },
+      {
+        state: 'reconnecting',
+        host: '100.64.0.2',
+        port: 48925,
+        hostInfo: null,
+        mirrorProtocol: 'v2',
+        mirrorSyncPhase: 'stale',
+        mirrorController: staleLease,
+        mirrorOwnsControl: true,
+      }
+    );
+
+    expect(reconciliation).toEqual({
+      patch: { controllerLease: null, ownsControl: false, syncPhase: 'stale' },
+      refreshProjection: false,
+    });
+  });
+
+  it('refreshes instead of exposing a snapshot from the previous projection', () => {
+    const snapshot = createEmptyWorkspaceSceneSnapshot(identity);
+    const reconciliation = reconcileWorkspaceMirrorRemoteStatus(
+      {
+        snapshot,
+        snapshotTarget: 'local',
+        syncPhase: 'live',
+        projectionTarget: 'transitioning',
+        controllerLease: null,
+        ownsControl: false,
+      },
+      {
+        state: 'connected',
+        host: '100.64.0.2',
+        port: 48925,
+        hostInfo: null,
+        mirrorProtocol: 'v2',
+        mirrorSyncPhase: 'live',
+        mirrorRevision: 0,
+        mirrorController: null,
+        mirrorOwnsControl: false,
+      }
+    );
+
+    expect(reconciliation).toEqual({ patch: {}, refreshProjection: true });
+  });
+
+  it('does not let a stale local refresh overwrite a newer remote snapshot', async () => {
+    const localSnapshot = createEmptyWorkspaceSceneSnapshot(identity);
+    const remoteSnapshot = createEmptyWorkspaceSceneSnapshot({
+      hostId: 'host-remote',
+      sceneId: 'scene-remote',
+      hostEpoch: '82ba9162-39cf-421a-82ff-80b505790f44',
+    });
+    let resolveSnapshot!: (snapshot: typeof localSnapshot) => void;
+    const getSnapshot = vi.fn(
+      () =>
+        new Promise<typeof localSnapshot>((resolve) => {
+          resolveSnapshot = resolve;
+        })
+    );
+    vi.stubGlobal('window', {
+      electronAPI: {
+        workspaceMirror: {
+          getSnapshot,
+          getBootstrapStatus: vi.fn().mockResolvedValue({ ready: true }),
+        },
+      },
+    });
+    useRemoteStore.setState({
+      status: { state: 'disconnected', host: null, port: null, hostInfo: null },
+    });
+
+    const refresh = useWorkspaceMirrorStore.getState().refresh();
+    useRemoteStore.setState({
+      status: {
+        state: 'connected',
+        host: '100.64.0.2',
+        port: 48925,
+        hostInfo: null,
+        mirrorProtocol: 'v2',
+        mirrorSyncPhase: 'live',
+        mirrorOwnsControl: false,
+      },
+    });
+    useWorkspaceMirrorStore.getState().hydrate(remoteSnapshot, 'remote');
+    resolveSnapshot(localSnapshot);
+    await refresh;
+
+    expect(getSnapshot).toHaveBeenCalledTimes(1);
+    expect(useWorkspaceMirrorStore.getState()).toMatchObject({
+      snapshot: remoteSnapshot,
+      snapshotTarget: 'remote',
+      projectionTarget: 'remote',
+    });
   });
 });

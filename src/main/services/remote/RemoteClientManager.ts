@@ -1136,6 +1136,7 @@ export class RemoteClientManager {
     // resume, but stop routing mirror writes until a new protocol is chosen.
     this.resetMirrorAssembly(conn);
     conn.negotiatedProtocol = undefined;
+    conn.mirrorLease = null;
     conn.mirrorSyncPhase = conn.mirrorSnapshot ? 'stale' : 'disconnected';
     if (conn.options.mirrorV2 !== false) {
       try {
@@ -1836,6 +1837,7 @@ export class RemoteClientManager {
       return;
     }
     conn.state = 'reconnecting';
+    conn.mirrorLease = null;
     if (conn.mirrorSnapshot) conn.mirrorSyncPhase = 'stale';
     this.pushStatus(conn);
 

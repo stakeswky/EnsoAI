@@ -15,6 +15,7 @@ import { isRemoteAttached, useRemoteStore } from './remote';
 
 interface WorkspaceMirrorState {
   snapshot: WorkspaceSceneSnapshot | null;
+  snapshotTarget: Exclude<WorkspaceProjectionTarget, 'transitioning'> | null;
   syncPhase: WorkspaceSyncPhase;
   projectionTarget: WorkspaceProjectionTarget;
   bootstrapReady: boolean;
@@ -32,6 +33,25 @@ interface WorkspaceMirrorState {
   dispatchMutation: (mutation: WorkspaceSceneMutation) => Promise<StateIntentResultFrame>;
   requestControl: (allowTransfer?: boolean) => Promise<ControllerLease>;
   releaseControl: () => Promise<void>;
+}
+
+type RemoteStatusProjectionState = Pick<
+  WorkspaceMirrorState,
+  | 'snapshot'
+  | 'snapshotTarget'
+  | 'syncPhase'
+  | 'projectionTarget'
+  | 'controllerLease'
+  | 'ownsControl'
+>;
+
+type RemoteStatusProjectionPatch = Partial<
+  Pick<WorkspaceMirrorState, 'syncPhase' | 'projectionTarget' | 'controllerLease' | 'ownsControl'>
+>;
+
+export interface RemoteStatusProjectionReconciliation {
+  patch: RemoteStatusProjectionPatch;
+  refreshProjection: boolean;
 }
 
 export type WorkspaceProjectionTarget = 'local' | 'remote' | 'transitioning';
@@ -60,7 +80,82 @@ export function getWorkspaceQueryScope(
   return `${projectionTarget}:${snapshot?.hostId ?? 'unknown'}:${snapshot?.sceneId ?? 'unknown'}`;
 }
 
+function getSettledProjectionTarget(
+  status: RemoteClientStatus | null
+): Exclude<WorkspaceProjectionTarget, 'transitioning'> | null {
+  if (status === null || status.state === 'connecting' || status.state === 'reconnecting') {
+    return null;
+  }
+  if (status.state === 'disconnected') return 'local';
+  if (status.mirrorProtocol === 'v1') return 'local';
+  if (status.mirrorProtocol === 'v2' && status.mirrorSyncPhase === 'live') return 'remote';
+  return null;
+}
+
+function sameControllerLease(left: ControllerLease | null, right: ControllerLease | null): boolean {
+  return (
+    left === right ||
+    (left !== null &&
+      right !== null &&
+      left.leaseId === right.leaseId &&
+      left.holderDeviceId === right.holderDeviceId &&
+      left.holderClientId === right.holderClientId &&
+      left.acquiredAt === right.acquiredAt &&
+      left.expiresAt === right.expiresAt &&
+      left.graceUntil === right.graceUntil &&
+      left.coordSeq === right.coordSeq)
+  );
+}
+
+export function reconcileWorkspaceMirrorRemoteStatus(
+  current: RemoteStatusProjectionState,
+  status: RemoteClientStatus
+): RemoteStatusProjectionReconciliation {
+  const patch: RemoteStatusProjectionPatch = {};
+  const connectedToV2 = status.state === 'connected' && status.mirrorProtocol === 'v2';
+  const nextLease = connectedToV2 ? (status.mirrorController ?? null) : null;
+  const nextOwnership = connectedToV2 && status.mirrorOwnsControl === true;
+
+  if (!sameControllerLease(current.controllerLease, nextLease)) {
+    patch.controllerLease = nextLease;
+  }
+  if (current.ownsControl !== nextOwnership) {
+    patch.ownsControl = nextOwnership;
+  }
+
+  if (status.state === 'reconnecting') {
+    if (current.syncPhase !== 'stale') patch.syncPhase = 'stale';
+    return { patch, refreshProjection: false };
+  }
+
+  const waitingForRemoteProjection =
+    status.state === 'connecting' ||
+    (status.state === 'connected' && status.mirrorProtocol === undefined) ||
+    (connectedToV2 && status.mirrorSyncPhase !== 'live');
+  if (waitingForRemoteProjection) {
+    if (current.projectionTarget !== 'transitioning') {
+      patch.projectionTarget = 'transitioning';
+    }
+    if (connectedToV2 && status.mirrorSyncPhase && current.syncPhase !== status.mirrorSyncPhase) {
+      patch.syncPhase = status.mirrorSyncPhase;
+    }
+    return { patch, refreshProjection: false };
+  }
+
+  const desiredTarget = connectedToV2 ? 'remote' : 'local';
+  if (current.snapshot !== null && current.snapshotTarget === desiredTarget) {
+    if (current.projectionTarget !== desiredTarget) patch.projectionTarget = desiredTarget;
+    if (current.syncPhase !== 'live') patch.syncPhase = 'live';
+    return { patch, refreshProjection: false };
+  }
+  if (current.projectionTarget !== 'transitioning') {
+    patch.projectionTarget = 'transitioning';
+  }
+  return { patch, refreshProjection: true };
+}
+
 let clientSequence = 0;
+let projectionRefreshSequence = 0;
 
 export function applyWorkspaceSceneEvent(
   current: WorkspaceSceneSnapshot,
@@ -160,6 +255,7 @@ export function applyWorkspaceSceneEvent(
 
 export const useWorkspaceMirrorStore = create<WorkspaceMirrorState>((set, get) => ({
   snapshot: null,
+  snapshotTarget: null,
   syncPhase: 'disconnected',
   projectionTarget: 'transitioning',
   bootstrapReady: false,
@@ -169,9 +265,11 @@ export const useWorkspaceMirrorStore = create<WorkspaceMirrorState>((set, get) =
   applyingAuthoritativeState: false,
 
   hydrate: (snapshot, target = 'local', bootstrapReady = target === 'remote') => {
+    projectionRefreshSequence += 1;
     const parsed = WorkspaceSceneSnapshotSchema.parse(snapshot);
     set({
       snapshot: parsed,
+      snapshotTarget: target,
       syncPhase: 'live',
       projectionTarget: target,
       bootstrapReady,
@@ -189,6 +287,7 @@ export const useWorkspaceMirrorStore = create<WorkspaceMirrorState>((set, get) =
     }
     try {
       const snapshot = applyWorkspaceSceneEvent(current, event);
+      projectionRefreshSequence += 1;
       set({ snapshot, syncPhase: 'live', error: null, applyingAuthoritativeState: true });
       queueMicrotask(() => set({ applyingAuthoritativeState: false }));
     } catch (error) {
@@ -202,8 +301,12 @@ export const useWorkspaceMirrorStore = create<WorkspaceMirrorState>((set, get) =
 
   refresh: async () => {
     const remoteStatus = useRemoteStore.getState().status;
-    const target =
-      isRemoteAttached(remoteStatus) && remoteStatus?.mirrorProtocol === 'v2' ? 'remote' : 'local';
+    const target = getSettledProjectionTarget(remoteStatus);
+    if (target === null) {
+      set({ projectionTarget: 'transitioning' });
+      return;
+    }
+    const refreshSequence = ++projectionRefreshSequence;
     set({ syncPhase: get().snapshot ? 'resyncing' : 'syncing', error: null });
     try {
       const [snapshot, bootstrapStatus] = await Promise.all([
@@ -212,8 +315,15 @@ export const useWorkspaceMirrorStore = create<WorkspaceMirrorState>((set, get) =
           ? window.electronAPI.workspaceMirror.getBootstrapStatus()
           : Promise.resolve({ ready: true }),
       ]);
+      if (
+        refreshSequence !== projectionRefreshSequence ||
+        getSettledProjectionTarget(useRemoteStore.getState().status) !== target
+      ) {
+        return;
+      }
       get().hydrate(snapshot, target, bootstrapStatus.ready);
     } catch (error) {
+      if (refreshSequence !== projectionRefreshSequence) return;
       set({
         syncPhase: 'stale',
         error: error instanceof Error ? error.message : String(error),
@@ -242,9 +352,20 @@ export const useWorkspaceMirrorStore = create<WorkspaceMirrorState>((set, get) =
   },
 
   requestControl: async (allowTransfer = false) => {
-    const lease = await window.electronAPI.workspaceMirror.requestControl(allowTransfer);
-    set({ controllerLease: lease, ownsControl: true });
-    return lease;
+    try {
+      const lease = await window.electronAPI.workspaceMirror.requestControl(allowTransfer);
+      set({ controllerLease: lease, ownsControl: true });
+      return lease;
+    } catch (error) {
+      const status = useRemoteStore.getState().status;
+      if (status?.state === 'connected' && status.mirrorProtocol === 'v2') {
+        set({
+          controllerLease: status.mirrorController ?? null,
+          ownsControl: status.mirrorOwnsControl === true,
+        });
+      }
+      throw error;
+    }
   },
 
   releaseControl: async () => {
@@ -266,13 +387,20 @@ export function initWorkspaceMirrorSync(): void {
   });
   window.electronAPI.workspaceMirror.onControlChanged((lease) => {
     const current = useWorkspaceMirrorStore.getState();
+    const attachedToV2 =
+      isRemoteAttached(useRemoteStore.getState().status) &&
+      useRemoteStore.getState().status?.mirrorProtocol === 'v2';
     useWorkspaceMirrorStore.setState({
       controllerLease: lease,
-      ownsControl: Boolean(
-        lease && current.controllerLease?.leaseId === lease.leaseId && current.ownsControl
-      ),
+      ...(attachedToV2
+        ? {}
+        : {
+            ownsControl: Boolean(
+              lease && current.controllerLease?.leaseId === lease.leaseId && current.ownsControl
+            ),
+          }),
     });
-    if (!lease && !isRemoteAttached(useRemoteStore.getState().status)) {
+    if (!lease && !attachedToV2) {
       setTimeout(() => {
         void useWorkspaceMirrorStore
           .getState()
@@ -291,23 +419,14 @@ export function initWorkspaceMirrorSync(): void {
       .catch(() => undefined);
   };
   const handleRemoteStatus = (status: RemoteClientStatus): void => {
-    const attachedToV2 = isRemoteAttached(status) && status.mirrorProtocol === 'v2';
-    useWorkspaceMirrorStore.setState({
-      controllerLease: attachedToV2 ? (status.mirrorController ?? null) : null,
-      ownsControl: attachedToV2 ? status.mirrorOwnsControl === true : false,
-    });
-    if (status.state === 'reconnecting') {
-      useWorkspaceMirrorStore.setState({ syncPhase: 'stale' });
-      return;
+    const reconciliation = reconcileWorkspaceMirrorRemoteStatus(
+      useWorkspaceMirrorStore.getState(),
+      status
+    );
+    if (Object.keys(reconciliation.patch).length > 0) {
+      useWorkspaceMirrorStore.setState(reconciliation.patch);
     }
-    useWorkspaceMirrorStore.setState({ projectionTarget: 'transitioning' });
-    if (
-      status.state === 'connecting' ||
-      (status.mirrorProtocol === 'v2' && status.mirrorSyncPhase !== 'live')
-    ) {
-      return;
-    }
-    void refreshAndTryControl();
+    if (reconciliation.refreshProjection) void refreshAndTryControl();
   };
   useRemoteStore.subscribe((state, previousState) => {
     if (!state.status || state.status === previousState.status) return;
