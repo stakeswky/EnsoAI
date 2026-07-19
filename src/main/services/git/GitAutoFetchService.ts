@@ -23,6 +23,7 @@ class GitAutoFetchService {
   private onFocusHandler: (() => void) | null = null;
   private headWatchers: Map<string, FSWatcher> = new Map();
   private headDebounceTimers: Map<string, NodeJS.Timeout> = new Map();
+  private workspaceUnsubscribe: (() => void) | null = null;
 
   init(window: BrowserWindow): void {
     // 防止重复初始化导致多个事件监听器
@@ -31,6 +32,18 @@ class GitAutoFetchService {
       return;
     }
     this.mainWindow = window;
+    const workspace = getWorkspaceMirrorService();
+    const syncWorkspacePaths = (): void => {
+      const nextPaths = new Set(
+        Object.values(workspace.getSnapshot().catalog.worktrees).map(({ path }) => path)
+      );
+      for (const existing of this.worktreePaths) {
+        if (!nextPaths.has(existing)) this.unregisterWorktree(existing);
+      }
+      for (const next of nextPaths) this.registerWorktree(next);
+    };
+    syncWorkspacePaths();
+    this.workspaceUnsubscribe = workspace.subscribe(syncWorkspacePaths);
 
     // 窗口获得焦点时检查（带防抖）
     this.onFocusHandler = () => {
@@ -50,6 +63,8 @@ class GitAutoFetchService {
 
   cleanup(): void {
     this.stop();
+    this.workspaceUnsubscribe?.();
+    this.workspaceUnsubscribe = null;
     // Collect keys first to avoid modifying Map during iteration
     for (const path of [...this.headWatchers.keys()]) {
       this.unwatchHead(path);
