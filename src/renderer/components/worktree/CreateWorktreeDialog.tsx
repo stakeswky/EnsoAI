@@ -270,6 +270,14 @@ export function CreateWorktreeDialog({
     };
   }, [branchConflict, workdir]);
 
+  const submitRegisteredWorktree = React.useCallback(
+    async (options: WorktreeCreateOptions) => {
+      await window.electronAPI.workspaceMirror.registerEntity('worktree', options.path);
+      await onSubmit(options);
+    },
+    [onSubmit]
+  );
+
   // PR items for combobox
   type PrItem = { id: string; label: string; value: PullRequest };
   const prItems = React.useMemo((): PrItem[] => {
@@ -304,7 +312,7 @@ export function CreateWorktreeDialog({
 
       const targetPath = getWorktreePath(newBranchName);
       try {
-        await onSubmit({
+        await submitRegisteredWorktree({
           path: targetPath,
           branch: effectiveBaseBranch,
           newBranch: newBranchName,
@@ -343,7 +351,7 @@ export function CreateWorktreeDialog({
         await window.electronAPI.git.fetchPullRequest(workdir, selectedPr.number, branchName);
 
         // Then create worktree from that branch (branch already exists, no newBranch needed)
-        await onSubmit({
+        await submitRegisteredWorktree({
           path: getWorktreePath(branchName),
           branch: branchName,
         });
@@ -437,7 +445,7 @@ export function CreateWorktreeDialog({
     if (!branchConflict) return;
     setReusing(true);
     try {
-      await onSubmit({
+      await submitRegisteredWorktree({
         path: branchConflict.path,
         branch: branchConflict.branchName,
       });

@@ -161,15 +161,22 @@ export function useRepositoryState() {
       }
 
       const name = getPathBasename(path);
-      const newRepo: Repository = {
-        name,
-        path,
-        groupId: groupId || undefined,
-      };
-
-      const updated = [...repositories, newRepo];
-      saveRepositories(updated);
-      setSelectedRepo(path);
+      void window.electronAPI.workspaceMirror
+        .registerEntity('repository', path)
+        .then((reservation) => {
+          const newRepo: Repository = {
+            id: reservation.entityId,
+            name,
+            path: reservation.path,
+            groupId: groupId || undefined,
+          };
+          const updated = [...repositories, newRepo];
+          saveRepositories(updated);
+          setSelectedRepo(reservation.path);
+        })
+        .catch((error) => {
+          console.warn('[workspace-mirror] repository registration failed', error);
+        });
     },
     [repositories, saveRepositories]
   );

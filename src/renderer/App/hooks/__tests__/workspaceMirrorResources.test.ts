@@ -1,14 +1,28 @@
 import { createEmptyWorkspaceSceneSnapshot } from '@shared/types';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAgentSessionsStore } from '@/stores/agentSessions';
 import { loadSnapshot as loadAgentTaskSnapshot, useAgentTasksStore } from '@/stores/agentTasks';
 import {
   buildAgents,
   buildNavigation,
+  buildWorkspaceCatalog,
   stageAndMaterializeWorkspaceResources,
-  workspaceEntityId,
+  unwrapWorkspaceEntityAdoptionResult,
+  WorkspaceEntityAdoptionConflictError,
   workspaceInvalidationQueryKey,
 } from '../useWorkspaceMirrorBridge';
+
+beforeEach(() => {
+  vi.stubGlobal('localStorage', {
+    getItem: () => null,
+    setItem: vi.fn(),
+    removeItem: vi.fn(),
+  });
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('workspace mirror Agent resources', () => {
   it('replaces client-local temp paths with materialized opaque references', async () => {
@@ -54,7 +68,117 @@ describe('workspace mirror resource invalidation', () => {
   });
 });
 
+describe('workspace mirror entity adoption', () => {
+  it('unwraps success and preserves typed conflict metadata', () => {
+    const reservation = {
+      sceneId: 'scene-1',
+      entityId: 'entity-1',
+      kind: 'repository' as const,
+      path: '/host/repository',
+      normalizedPath: '/host/repository',
+      disposition: 'adopted' as const,
+    };
+    expect(unwrapWorkspaceEntityAdoptionResult({ ok: true, reservation })).toEqual(reservation);
+
+    let thrown: unknown;
+    try {
+      unwrapWorkspaceEntityAdoptionResult({
+        ok: false,
+        error: {
+          code: 'ENTITY_ADOPTION_CONFLICT',
+          message: 'Workspace path belongs to another entity',
+          conflictingEntityIds: ['entity-2'],
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(WorkspaceEntityAdoptionConflictError);
+    expect(thrown).toMatchObject({
+      code: 'ENTITY_ADOPTION_CONFLICT',
+      message: 'Workspace path belongs to another entity',
+      conflictingEntityIds: ['entity-2'],
+    });
+  });
+});
+
 describe('workspace mirror atomic catalog navigation', () => {
+  it('uses resolved opaque IDs and preserves them when host paths change', () => {
+    const previous = createEmptyWorkspaceSceneSnapshot({
+      hostId: 'host',
+      sceneId: 'scene',
+      hostEpoch: '11111111-1111-4111-8111-111111111111',
+    }).catalog;
+    const catalog = buildWorkspaceCatalog(
+      [{ id: 'repository-stable', name: 'repo', path: '/renamed/repo' }],
+      [],
+      [
+        {
+          id: 'worktree-stable',
+          path: '/renamed/repo/worktree',
+          head: 'abc',
+          branch: 'main',
+          isMainWorktree: false,
+          isLocked: false,
+          prunable: false,
+        },
+      ],
+      '/renamed/repo',
+      {},
+      previous
+    );
+
+    expect(Object.keys(catalog.repositories)).toEqual(['repository-stable']);
+    expect(Object.keys(catalog.worktrees)).toEqual(['worktree-stable']);
+    expect(catalog.worktrees['worktree-stable']?.repositoryId).toBe('repository-stable');
+  });
+
+  it.each([
+    ['MacIntel', 'C:\\Host\\Repository', 'C:\\Host\\Repository\\worktree'],
+    ['Win32', '/srv/host/repository', '/srv/host/repository/worktree'],
+    ['Linux x86_64', 'C:\\Host\\Repository', 'C:\\Host\\Repository\\worktree'],
+  ])('keeps host-issued IDs independent of the %s client platform', (platform, repoPath, worktreePath) => {
+    vi.stubGlobal('navigator', { platform });
+    const previous = createEmptyWorkspaceSceneSnapshot({
+      hostId: 'host',
+      sceneId: 'scene',
+      hostEpoch: '11111111-1111-4111-8111-111111111111',
+    }).catalog;
+    const catalog = buildWorkspaceCatalog(
+      [{ id: 'host-repository-id', name: 'repo', path: repoPath }],
+      [],
+      [
+        {
+          id: 'host-worktree-id',
+          path: worktreePath,
+          head: 'abc',
+          branch: 'main',
+          isMainWorktree: false,
+          isLocked: false,
+          prunable: false,
+        },
+      ],
+      repoPath,
+      {},
+      previous
+    );
+
+    expect(Object.keys(catalog.repositories)).toEqual(['host-repository-id']);
+    expect(Object.keys(catalog.worktrees)).toEqual(['host-worktree-id']);
+    expect(catalog.worktrees['host-worktree-id']?.repositoryId).toBe('host-repository-id');
+  });
+
+  it('blocks path-only entities before scene publication', () => {
+    const previous = createEmptyWorkspaceSceneSnapshot({
+      hostId: 'host',
+      sceneId: 'scene',
+      hostEpoch: '11111111-1111-4111-8111-111111111111',
+    }).catalog;
+    expect(() =>
+      buildWorkspaceCatalog([{ name: 'repo', path: '/unresolved' }], [], [], null, {}, previous)
+    ).toThrow(/identity is unresolved/);
+  });
+
   it('drops selections whose repository, group, or worktree was removed', () => {
     const previous = createEmptyWorkspaceSceneSnapshot({
       hostId: 'host',
@@ -68,6 +192,7 @@ describe('workspace mirror atomic catalog navigation', () => {
         groups: [],
         activeGroupId: 'removed-group',
         setRepositories: vi.fn(),
+        saveRepositories: vi.fn(),
         setGroups: vi.fn(),
         setSelectedRepo: vi.fn(),
         setActiveGroupId: vi.fn(),
@@ -106,15 +231,10 @@ describe('workspace mirror atomic catalog navigation', () => {
 
 describe('workspace mirror Agent semantic state', () => {
   it('preserves provider resume identity and task waiting state', () => {
-    vi.stubGlobal('localStorage', {
-      getItem: () => null,
-      setItem: vi.fn(),
-      removeItem: vi.fn(),
-    });
     const repositoryPath = '/host/repo';
     const worktreePath = '/host/repo/worktree';
-    const repositoryId = workspaceEntityId('repo', repositoryPath);
-    const worktreeId = workspaceEntityId('worktree', worktreePath);
+    const repositoryId = 'opaque-repository-id';
+    const worktreeId = 'opaque-worktree-id';
     useAgentSessionsStore.setState({
       sessions: [
         {

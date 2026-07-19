@@ -357,6 +357,7 @@ export function AddRepositoryDialog({
       setCloneProgress(null);
 
       try {
+        await window.electronAPI.workspaceMirror.registerEntity('repository', fullPath);
         const result = await window.electronAPI.git.clone(remoteUrl.trim(), fullPath);
         if (result.success) {
           completeCloneTask(taskId);

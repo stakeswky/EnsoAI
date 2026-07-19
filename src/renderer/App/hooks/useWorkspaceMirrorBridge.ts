@@ -6,6 +6,8 @@ import {
   type TerminalScene,
   type TodoScene,
   type WorkspaceCatalogScene,
+  type WorkspaceEntityAdoptionResult,
+  type WorkspaceEntityReservation,
   type WorkspacePanelId,
   type WorkspaceResourceInvalidation,
   type WorkspaceSceneMutation,
@@ -43,6 +45,7 @@ export interface RepositoryBridgeState {
   groups: RepositoryGroup[];
   activeGroupId: string;
   setRepositories: Dispatch<SetStateAction<Repository[]>>;
+  saveRepositories: (repositories: Repository[]) => void;
   setGroups: Dispatch<SetStateAction<RepositoryGroup[]>>;
   setSelectedRepo: Dispatch<SetStateAction<string | null>>;
   setActiveGroupId: Dispatch<SetStateAction<string>>;
@@ -119,8 +122,46 @@ function hashPath(value: string): string {
   return `${first.toString(16).padStart(8, '0')}${second.toString(16).padStart(8, '0')}`;
 }
 
-export function workspaceEntityId(kind: 'repo' | 'worktree', hostPath: string): string {
-  return `${kind}-${hashPath(hostPath)}`;
+function hostPathKey(hostPath: string): string {
+  return normalizeHostPath(hostPath).replace(/\/$/, '');
+}
+
+export class WorkspaceEntityAdoptionConflictError extends Error {
+  readonly code = 'ENTITY_ADOPTION_CONFLICT' as const;
+
+  constructor(
+    message: string,
+    readonly conflictingEntityIds?: string[]
+  ) {
+    super(message);
+    this.name = 'WorkspaceEntityAdoptionConflictError';
+  }
+}
+
+export function unwrapWorkspaceEntityAdoptionResult(
+  result: WorkspaceEntityAdoptionResult
+): WorkspaceEntityReservation {
+  if (result.ok) return result.reservation;
+  throw new WorkspaceEntityAdoptionConflictError(
+    result.error.message,
+    result.error.conflictingEntityIds
+  );
+}
+
+function repositoryIdForPath(catalog: WorkspaceCatalogScene, path: string): string | null {
+  const key = hostPathKey(path);
+  return (
+    Object.values(catalog.repositories).find((repository) => hostPathKey(repository.path) === key)
+      ?.id ?? null
+  );
+}
+
+function worktreeIdForPath(catalog: WorkspaceCatalogScene, path: string): string | null {
+  const key = hostPathKey(path);
+  return (
+    Object.values(catalog.worktrees).find((worktree) => hostPathKey(worktree.path) === key)?.id ??
+    null
+  );
 }
 
 export async function stageAndMaterializeWorkspaceResources(
@@ -165,7 +206,8 @@ export function buildWorkspaceCatalog(
 ): WorkspaceCatalogScene {
   const repositoryRecords: WorkspaceCatalogScene['repositories'] = {};
   repositories.forEach((repository, order) => {
-    const id = workspaceEntityId('repo', repository.path);
+    if (!repository.id) throw new Error(`Repository identity is unresolved: ${repository.path}`);
+    const id = repository.id;
     repositoryRecords[id] = {
       id,
       path: repository.path,
@@ -185,12 +227,16 @@ export function buildWorkspaceCatalog(
     )
   );
   if (selectedRepo) {
-    const repositoryId = workspaceEntityId('repo', selectedRepo);
+    const repositoryId = repositories.find(
+      (repository) => hostPathKey(repository.path) === hostPathKey(selectedRepo)
+    )?.id;
+    if (!repositoryId) throw new Error(`Repository identity is unresolved: ${selectedRepo}`);
     for (const [id, worktree] of Object.entries(worktreeRecords)) {
       if (worktree.repositoryId === repositoryId) delete worktreeRecords[id];
     }
     for (const worktree of worktrees) {
-      const id = workspaceEntityId('worktree', worktree.path);
+      if (!worktree.id) throw new Error(`Worktree identity is unresolved: ${worktree.path}`);
+      const id = worktree.id;
       worktreeRecords[id] = {
         id,
         repositoryId,
@@ -214,14 +260,15 @@ export function buildNavigation(
 ): NavigationScene {
   const activeWorktreePath = worktreeState.activeWorktree?.path ?? null;
   const activeWorktreeId = activeWorktreePath
-    ? workspaceEntityId('worktree', activeWorktreePath)
+    ? worktreeIdForPath(catalog, activeWorktreePath)
     : null;
   const selectedRepositoryId = repositoryState.selectedRepo
-    ? workspaceEntityId('repo', repositoryState.selectedRepo)
+    ? repositoryIdForPath(catalog, repositoryState.selectedRepo)
     : null;
   const activePanelByWorktree: NavigationScene['activePanelByWorktree'] = {};
   for (const [path, tab] of Object.entries(worktreeState.worktreeTabMap)) {
-    const id = workspaceEntityId('worktree', path);
+    const id = worktreeIdForPath(catalog, path);
+    if (!id) continue;
     if (catalog.worktrees[id]) activePanelByWorktree[id] = sharedPanel(tab);
   }
   const panelOrderByWorktree: NavigationScene['panelOrderByWorktree'] = {};
@@ -259,8 +306,8 @@ function buildEditors(
   }
   const editors: Record<string, EditorScene> = {};
   for (const [path, editor] of Object.entries(states)) {
-    const worktreeId = workspaceEntityId('worktree', path);
-    if (!catalog.worktrees[worktreeId]) continue;
+    const worktreeId = worktreeIdForPath(catalog, path);
+    if (!worktreeId || !catalog.worktrees[worktreeId]) continue;
     editors[worktreeId] = {
       tabs: editor.tabs.map((tab, order) => ({
         id: `file-${hashPath(tab.path)}`,
@@ -298,8 +345,8 @@ export function buildAgents(
   const sessions: WorkspaceSceneSnapshot['agents']['sessions'] = {};
   for (const session of state.sessions) {
     const previousSession = previous?.sessions[session.id];
-    const repositoryId = workspaceEntityId('repo', session.repoPath);
-    const worktreeId = workspaceEntityId('worktree', session.cwd);
+    const repositoryId = repositoryIdForPath(catalog, session.repoPath);
+    const worktreeId = worktreeIdForPath(catalog, session.cwd);
     const runtimeState = state.runtimeStates[session.id]?.outputState ?? 'idle';
     const task = tasks[session.id];
     const projectedRuntimeState =
@@ -312,8 +359,8 @@ export function buildAgents(
       generation: previousSession?.generation ?? 1,
       agentId: session.agentId,
       name: session.name,
-      repositoryId: catalog.repositories[repositoryId] ? repositoryId : null,
-      worktreeId: catalog.worktrees[worktreeId] ? worktreeId : null,
+      repositoryId: repositoryId && catalog.repositories[repositoryId] ? repositoryId : null,
+      worktreeId: worktreeId && catalog.worktrees[worktreeId] ? worktreeId : null,
       terminalSessionId: previousSession?.terminalSessionId ?? session.id,
       environment: session.environment ?? 'native',
       initialized: session.initialized,
@@ -347,8 +394,8 @@ export function buildAgents(
 
   const groups: WorkspaceSceneSnapshot['agents']['groups'] = {};
   for (const [worktreePath, groupState] of Object.entries(state.groupStates)) {
-    const worktreeId = workspaceEntityId('worktree', worktreePath);
-    if (!catalog.worktrees[worktreeId]) continue;
+    const worktreeId = worktreeIdForPath(catalog, worktreePath);
+    if (!worktreeId || !catalog.worktrees[worktreeId]) continue;
     groupState.groups.forEach((group, order) => {
       groups[group.id] = {
         id: group.id,
@@ -381,13 +428,13 @@ function buildTerminals(
   const sessions: TerminalScene['sessions'] = {};
   for (const session of state.sessions) {
     const previousSession = previous.sessions[session.id];
-    const worktreeId = workspaceEntityId('worktree', session.cwd);
-    const worktree = catalog.worktrees[worktreeId];
+    const worktreeId = worktreeIdForPath(catalog, session.cwd);
+    const worktree = worktreeId ? catalog.worktrees[worktreeId] : undefined;
     sessions[session.id] = {
       id: session.id,
       generation: previousSession?.generation ?? 1,
       repositoryId: worktree?.repositoryId ?? null,
-      worktreeId: worktree ? worktreeId : null,
+      worktreeId: worktree && worktreeId ? worktreeId : null,
       title: session.title,
       cwd: session.cwd,
       groupId: null,
@@ -407,13 +454,13 @@ function buildTerminals(
   for (const session of agentState.sessions) {
     if (sessions[session.id]) continue;
     const previousSession = previous.sessions[session.id];
-    const worktreeId = workspaceEntityId('worktree', session.cwd);
-    const worktree = catalog.worktrees[worktreeId];
+    const worktreeId = worktreeIdForPath(catalog, session.cwd);
+    const worktree = worktreeId ? catalog.worktrees[worktreeId] : undefined;
     sessions[session.id] = {
       id: session.id,
       generation: previousSession?.generation ?? 1,
       repositoryId: worktree?.repositoryId ?? null,
-      worktreeId: worktree ? worktreeId : null,
+      worktreeId: worktree && worktreeId ? worktreeId : null,
       title: session.terminalTitle ?? session.name,
       cwd: session.cwd || '/',
       groupId: null,
@@ -450,8 +497,8 @@ function buildTerminals(
   }
   const quickSessionByWorktree: Record<string, string> = {};
   for (const [path, sessionId] of Object.entries(state.quickTerminalSessions)) {
-    const worktreeId = workspaceEntityId('worktree', path);
-    if (catalog.worktrees[worktreeId] && sessions[sessionId]) {
+    const worktreeId = worktreeIdForPath(catalog, path);
+    if (worktreeId && catalog.worktrees[worktreeId] && sessions[sessionId]) {
       quickSessionByWorktree[worktreeId] = sessionId;
     }
   }
@@ -527,8 +574,8 @@ function buildSelections(
     )
   );
   if (activeWorktree) {
-    const worktreeId = workspaceEntityId('worktree', activeWorktree.path);
-    if (catalog.worktrees[worktreeId]) {
+    const worktreeId = worktreeIdForPath(catalog, activeWorktree.path);
+    if (worktreeId && catalog.worktrees[worktreeId]) {
       const selectedDiff = useSourceControlStore.getState().selectedFile;
       selectedDiffByWorktree[worktreeId] = selectedDiff
         ? joinPath(activeWorktree.path, selectedDiff.path)
@@ -623,8 +670,9 @@ function applySnapshotToRenderer(
     (a, b) => a.order - b.order
   );
   const groups = Object.values(snapshot.catalog.groups).sort((a, b) => a.order - b.order);
-  repositoryState.setRepositories(
+  repositoryState.saveRepositories(
     repositories.map((repository) => ({
+      id: repository.id,
       name: repository.name,
       path: repository.path,
       ...(repository.groupId ? { groupId: repository.groupId } : {}),
@@ -968,6 +1016,7 @@ export function useWorkspaceMirrorBridge(
   const activeProjectionKeyRef = useRef('local');
   const editorOverlaysRef = useRef(new Map<string, EditorDeviceOverlay>());
   const editorHydrationGenerationRef = useRef(0);
+  const entityResolutionGenerationRef = useRef(0);
   repositoryStateRef.current = repositoryState;
   worktreeStateRef.current = worktreeState;
 
@@ -1114,12 +1163,109 @@ export function useWorkspaceMirrorBridge(
     }
   }, [agentDrafts]);
 
+  useEffect(() => {
+    if (!legacyStateReady || !ownsControl || projectionTarget === 'transitioning') return;
+    const candidates = [
+      ...repositoryState.repositories
+        .filter((repository) => !repository.id)
+        .map((repository) => ({ kind: 'repository' as const, path: repository.path })),
+      ...worktrees
+        .filter((worktree) => !worktree.id)
+        .map((worktree) => ({ kind: 'worktree' as const, path: worktree.path })),
+    ];
+    if (candidates.length === 0) return;
+
+    const generation = ++entityResolutionGenerationRef.current;
+    void (async () => {
+      const resolutions = await window.electronAPI.workspaceMirror.resolveEntities(candidates);
+      const entityIds = new Map<string, string>();
+      for (const [index, candidate] of candidates.entries()) {
+        const resolution = resolutions[index];
+        if (!resolution || resolution.status === 'ambiguous') {
+          throw new Error(`Workspace entity path is ambiguous: ${candidate.path}`);
+        }
+        if (resolution.status === 'resolved') {
+          if (
+            resolution.match === 'alias' &&
+            hostPathKey(resolution.currentPath) !== hostPathKey(candidate.path)
+          ) {
+            const adopted = unwrapWorkspaceEntityAdoptionResult(
+              await window.electronAPI.workspaceMirror.adoptEntity(
+                candidate.kind,
+                resolution.entityId,
+                candidate.path
+              )
+            );
+            entityIds.set(`${candidate.kind}\0${hostPathKey(candidate.path)}`, adopted.entityId);
+            continue;
+          }
+          entityIds.set(`${candidate.kind}\0${hostPathKey(candidate.path)}`, resolution.entityId);
+          continue;
+        }
+        const projectedPaths = new Set(
+          (candidate.kind === 'repository' ? repositoryState.repositories : worktrees).map(
+            (entity) => hostPathKey(entity.path)
+          )
+        );
+        const missingDurableEntities = snapshot
+          ? Object.values(
+              candidate.kind === 'repository'
+                ? snapshot.catalog.repositories
+                : snapshot.catalog.worktrees
+            ).filter((entity) => !projectedPaths.has(hostPathKey(entity.path)))
+          : [];
+        if (missingDurableEntities.length > 0) {
+          throw new Error(`Workspace entity path requires explicit adoption: ${candidate.path}`);
+        }
+        const reservation = await window.electronAPI.workspaceMirror.registerEntity(
+          candidate.kind,
+          candidate.path
+        );
+        entityIds.set(`${candidate.kind}\0${hostPathKey(candidate.path)}`, reservation.entityId);
+      }
+      if (generation !== entityResolutionGenerationRef.current) return;
+
+      repositoryStateRef.current.saveRepositories(
+        repositoryStateRef.current.repositories.map((repository) => ({
+          ...repository,
+          id: repository.id ?? entityIds.get(`repository\0${hostPathKey(repository.path)}`),
+        }))
+      );
+      useWorktreeStore.setState((state) => ({
+        worktrees: state.worktrees.map((worktree) => ({
+          ...worktree,
+          id: worktree.id ?? entityIds.get(`worktree\0${hostPathKey(worktree.path)}`),
+        })),
+        currentWorktree: state.currentWorktree
+          ? {
+              ...state.currentWorktree,
+              id:
+                state.currentWorktree.id ??
+                entityIds.get(`worktree\0${hostPathKey(state.currentWorktree.path)}`),
+            }
+          : null,
+      }));
+    })().catch((error) => {
+      console.warn('[workspace-mirror] entity resolution blocked scene publication', error);
+    });
+  }, [
+    legacyStateReady,
+    ownsControl,
+    projectionTarget,
+    snapshot,
+    repositoryState.repositories,
+    worktrees,
+  ]);
+
   const snapshotCatalogSignature = snapshot ? canonicalJson(snapshot.catalog) : null;
+  const entitiesResolved =
+    repositoryState.repositories.every((repository) => Boolean(repository.id)) &&
+    worktrees.every((worktree) => Boolean(worktree.id));
   const catalog = useMemo(() => {
     void repositorySettingsRevision;
     void snapshotCatalogSignature;
     const snapshotCatalog = useWorkspaceMirrorStore.getState().snapshot?.catalog;
-    return snapshotCatalog
+    return snapshotCatalog && entitiesResolved
       ? buildWorkspaceCatalog(
           repositoryState.repositories,
           repositoryState.groups,
@@ -1137,6 +1283,7 @@ export function useWorkspaceMirrorBridge(
     worktrees,
     worktreeState.worktreeOrderMap,
     repositorySettingsRevision,
+    entitiesResolved,
   ]);
 
   useEffect(() => {
