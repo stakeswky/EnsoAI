@@ -3,6 +3,7 @@ import { disposeClaudeIdeBridge } from '../services/claude/ClaudeIdeBridge';
 import { installIpcInterceptor } from '../services/remote/handlerRegistry';
 import { autoUpdaterService } from '../services/updater/AutoUpdater';
 import { webInspectorServer } from '../services/webInspector';
+import { cleanupWorkspaceMirrorRuntime } from '../services/workspace/workspaceMirrorRuntime';
 import { cleanupExecInPtys, cleanupExecInPtysSync } from '../utils/shell';
 import { registerAgentHandlers } from './agent';
 import { registerAppHandlers } from './app';
@@ -50,6 +51,7 @@ import { cleanupTmuxSync, registerTmuxHandlers } from './tmux';
 import { cleanupTodo, cleanupTodoSync, registerTodoHandlers } from './todo';
 import { registerUpdaterHandlers } from './updater';
 import { registerWebInspectorHandlers } from './webInspector';
+import { registerWorkspaceMirrorHandlers } from './workspaceMirror';
 import { clearAllWorktreeServices, registerWorktreeHandlers } from './worktree';
 
 export function registerIpcHandlers(): void {
@@ -80,6 +82,7 @@ export function registerIpcHandlers(): void {
   registerTmuxHandlers();
   registerTodoHandlers();
   registerRemoteHandlers();
+  registerWorkspaceMirrorHandlers();
 }
 
 export async function cleanupAllResources(): Promise<void> {
@@ -123,6 +126,7 @@ export async function cleanupAllResources(): Promise<void> {
       safeRun(() => cleanupTempFiles(), 'tempFiles'),
       // Remote host server + client connections
       safeRun(() => cleanupRemote(), 'remote'),
+      safeRun(() => cleanupWorkspaceMirrorRuntime(), 'workspaceMirror'),
     ]),
     deadline,
   ]);

@@ -1,5 +1,6 @@
 import type { GitWorktree } from '@shared/types';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { isLocalWorkspaceProjection } from '@/stores/workspaceMirror';
 import type { TabId } from '../constants';
 import {
   getStoredTabMap,
@@ -31,11 +32,13 @@ export function useWorktreeState() {
 
   // Persist worktree tab map to localStorage
   useEffect(() => {
+    if (!isLocalWorkspaceProjection()) return;
     localStorage.setItem(STORAGE_KEYS.WORKTREE_TABS, JSON.stringify(worktreeTabMap));
   }, [worktreeTabMap]);
 
   // Persist panel tab order to localStorage
   useEffect(() => {
+    if (!isLocalWorkspaceProjection()) return;
     saveTabOrder(tabOrder);
   }, [tabOrder]);
 
@@ -45,14 +48,18 @@ export function useWorktreeState() {
       if (selectedRepo && worktree) {
         setRepoWorktreeMap((prev) => {
           const updated = { ...prev, [selectedRepo]: worktree.path };
-          localStorage.setItem(STORAGE_KEYS.ACTIVE_WORKTREES, JSON.stringify(updated));
+          if (isLocalWorkspaceProjection()) {
+            localStorage.setItem(STORAGE_KEYS.ACTIVE_WORKTREES, JSON.stringify(updated));
+          }
           return updated;
         });
       } else if (selectedRepo && !worktree) {
         setRepoWorktreeMap((prev) => {
           const updated = { ...prev };
           delete updated[selectedRepo];
-          localStorage.setItem(STORAGE_KEYS.ACTIVE_WORKTREES, JSON.stringify(updated));
+          if (isLocalWorkspaceProjection()) {
+            localStorage.setItem(STORAGE_KEYS.ACTIVE_WORKTREES, JSON.stringify(updated));
+          }
           return updated;
         });
       }
@@ -88,7 +95,7 @@ export function useWorktreeState() {
 
       const newOrderMap = { ...worktreeOrderMap, [selectedRepo]: newRepoOrder };
       setWorktreeOrderMap(newOrderMap);
-      saveWorktreeOrderMap(newOrderMap);
+      if (isLocalWorkspaceProjection()) saveWorktreeOrderMap(newOrderMap);
     },
     [worktreeOrderMap]
   );
@@ -137,6 +144,7 @@ export function useWorktreeState() {
     currentWorktreePathRef,
     setWorktreeTabMap,
     setRepoWorktreeMap,
+    setWorktreeOrderMap,
     setTabOrder,
     setActiveTab,
     setPreviousTab,

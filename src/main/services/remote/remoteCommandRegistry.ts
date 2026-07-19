@@ -1,0 +1,197 @@
+import { IPC_CHANNELS, REMOTE_FS_READ_FILE_CHANNEL } from '../../../shared/types';
+import { getRemoteCommandDescriptor } from './remoteCommandManifest';
+
+/**
+ * V1 commands that a remote host is allowed to dispatch.
+ *
+ * Keep this list explicit. A channel matching a forwarded prefix is not
+ * sufficient authorization: newly added or local-only channels must opt in
+ * here before they can be reached through the host WebSocket.
+ */
+export const V1_REMOTE_COMMAND_CHANNELS = [
+  // Git
+  IPC_CHANNELS.GIT_STATUS,
+  IPC_CHANNELS.GIT_COMMIT,
+  IPC_CHANNELS.GIT_PUSH,
+  IPC_CHANNELS.GIT_PULL,
+  IPC_CHANNELS.GIT_FETCH,
+  IPC_CHANNELS.GIT_BRANCH_LIST,
+  IPC_CHANNELS.GIT_BRANCH_CREATE,
+  IPC_CHANNELS.GIT_BRANCH_CHECKOUT,
+  IPC_CHANNELS.GIT_BRANCH_HEAD_INFO,
+  IPC_CHANNELS.GIT_LOG,
+  IPC_CHANNELS.GIT_DIFF,
+  IPC_CHANNELS.GIT_INIT,
+  IPC_CHANNELS.GIT_FILE_CHANGES,
+  IPC_CHANNELS.GIT_FILE_DIFF,
+  IPC_CHANNELS.GIT_STAGE,
+  IPC_CHANNELS.GIT_UNSTAGE,
+  IPC_CHANNELS.GIT_DISCARD,
+  IPC_CHANNELS.GIT_COMMIT_SHOW,
+  IPC_CHANNELS.GIT_COMMIT_FILES,
+  IPC_CHANNELS.GIT_COMMIT_DIFF,
+  IPC_CHANNELS.GIT_DIFF_STATS,
+  IPC_CHANNELS.GIT_GENERATE_COMMIT_MSG,
+  IPC_CHANNELS.GIT_GENERATE_BRANCH_NAME,
+  IPC_CHANNELS.GIT_CODE_REVIEW_START,
+  IPC_CHANNELS.GIT_CODE_REVIEW_STOP,
+  IPC_CHANNELS.GIT_GH_STATUS,
+  IPC_CHANNELS.GIT_PR_LIST,
+  IPC_CHANNELS.GIT_PR_FETCH,
+  IPC_CHANNELS.GIT_CLONE,
+  IPC_CHANNELS.GIT_VALIDATE_URL,
+  IPC_CHANNELS.GIT_BLAME,
+  IPC_CHANNELS.GIT_REVERT,
+  IPC_CHANNELS.GIT_RESET,
+  IPC_CHANNELS.GIT_AUTO_FETCH_SET_ENABLED,
+  IPC_CHANNELS.GIT_SUBMODULE_LIST,
+  IPC_CHANNELS.GIT_SUBMODULE_INIT,
+  IPC_CHANNELS.GIT_SUBMODULE_UPDATE,
+  IPC_CHANNELS.GIT_SUBMODULE_SYNC,
+  IPC_CHANNELS.GIT_SUBMODULE_FETCH,
+  IPC_CHANNELS.GIT_SUBMODULE_PULL,
+  IPC_CHANNELS.GIT_SUBMODULE_PUSH,
+  IPC_CHANNELS.GIT_SUBMODULE_COMMIT,
+  IPC_CHANNELS.GIT_SUBMODULE_STAGE,
+  IPC_CHANNELS.GIT_SUBMODULE_UNSTAGE,
+  IPC_CHANNELS.GIT_SUBMODULE_DISCARD,
+  IPC_CHANNELS.GIT_SUBMODULE_CHANGES,
+  IPC_CHANNELS.GIT_SUBMODULE_FILE_DIFF,
+  IPC_CHANNELS.GIT_SUBMODULE_BRANCHES,
+  IPC_CHANNELS.GIT_SUBMODULE_CHECKOUT,
+  IPC_CHANNELS.GIT_VALIDATE_LOCAL_PATH,
+
+  // Worktree
+  IPC_CHANNELS.WORKTREE_LIST,
+  IPC_CHANNELS.WORKTREE_ADD,
+  IPC_CHANNELS.WORKTREE_REMOVE,
+  IPC_CHANNELS.WORKTREE_ACTIVATE,
+  IPC_CHANNELS.WORKTREE_MERGE,
+  IPC_CHANNELS.WORKTREE_MERGE_STATE,
+  IPC_CHANNELS.WORKTREE_MERGE_CONFLICTS,
+  IPC_CHANNELS.WORKTREE_MERGE_CONFLICT_CONTENT,
+  IPC_CHANNELS.WORKTREE_MERGE_RESOLVE,
+  IPC_CHANNELS.WORKTREE_MERGE_ABORT,
+  IPC_CHANNELS.WORKTREE_MERGE_CONTINUE,
+
+  // Temporary workspace
+  IPC_CHANNELS.TEMP_WORKSPACE_CREATE,
+  IPC_CHANNELS.TEMP_WORKSPACE_REMOVE,
+  IPC_CHANNELS.TEMP_WORKSPACE_CHECK_PATH,
+
+  // Files
+  IPC_CHANNELS.FILE_READ,
+  IPC_CHANNELS.FILE_WRITE,
+  IPC_CHANNELS.FILE_SAVE_TO_TEMP,
+  IPC_CHANNELS.FILE_CREATE,
+  IPC_CHANNELS.FILE_CREATE_DIR,
+  IPC_CHANNELS.FILE_RENAME,
+  IPC_CHANNELS.FILE_MOVE,
+  IPC_CHANNELS.FILE_COPY,
+  IPC_CHANNELS.FILE_BATCH_MOVE,
+  IPC_CHANNELS.FILE_BATCH_COPY,
+  IPC_CHANNELS.FILE_CHECK_CONFLICTS,
+  IPC_CHANNELS.FILE_DELETE,
+  IPC_CHANNELS.FILE_LIST,
+  IPC_CHANNELS.FILE_EXISTS,
+  IPC_CHANNELS.FILE_REVEAL_IN_FILE_MANAGER,
+  IPC_CHANNELS.FILE_WATCH_START,
+  IPC_CHANNELS.FILE_WATCH_STOP,
+
+  // Terminal
+  IPC_CHANNELS.TERMINAL_CREATE,
+  IPC_CHANNELS.TERMINAL_WRITE,
+  IPC_CHANNELS.TERMINAL_RESIZE,
+  IPC_CHANNELS.TERMINAL_DESTROY,
+  IPC_CHANNELS.TERMINAL_ATTACH,
+  IPC_CHANNELS.TERMINAL_DETACH,
+  IPC_CHANNELS.TERMINAL_LIST_PERSISTENT,
+  IPC_CHANNELS.TERMINAL_GET_ACTIVITY,
+
+  // Shell and search
+  IPC_CHANNELS.SHELL_DETECT,
+  IPC_CHANNELS.SHELL_RESOLVE_FOR_COMMAND,
+  IPC_CHANNELS.SEARCH_FILES,
+  IPC_CHANNELS.SEARCH_CONTENT,
+
+  // Host-owned Agent/Todo state and runtime helpers
+  IPC_CHANNELS.AGENT_LIST,
+  IPC_CHANNELS.TODO_GET_TASKS,
+  IPC_CHANNELS.TODO_ADD_TASK,
+  IPC_CHANNELS.TODO_UPDATE_TASK,
+  IPC_CHANNELS.TODO_DELETE_TASK,
+  IPC_CHANNELS.TODO_MOVE_TASK,
+  IPC_CHANNELS.TODO_REORDER_TASKS,
+  IPC_CHANNELS.TODO_AI_POLISH,
+  IPC_CHANNELS.TMUX_CHECK,
+  IPC_CHANNELS.TMUX_KILL_SESSION,
+
+  // Host-only preview bytes endpoint. This is intentionally not a renderer
+  // forwarded channel, but it is dispatched by the V1 host server.
+  REMOTE_FS_READ_FILE_CHANNEL,
+  IPC_CHANNELS.WORKSPACE_MIRROR_GET_SNAPSHOT,
+  IPC_CHANNELS.WORKSPACE_MIRROR_DISPATCH_INTENT,
+  IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL,
+  IPC_CHANNELS.WORKSPACE_MIRROR_RELEASE_CONTROL,
+  IPC_CHANNELS.WORKSPACE_MIRROR_RESOLVE_ENTITIES,
+  IPC_CHANNELS.WORKSPACE_MIRROR_REGISTER_ENTITY,
+  IPC_CHANNELS.WORKSPACE_MIRROR_ADOPT_ENTITY,
+  IPC_CHANNELS.WORKSPACE_MIRROR_STAGE_RESOURCE,
+  IPC_CHANNELS.WORKSPACE_MIRROR_MATERIALIZE_RESOURCE,
+  IPC_CHANNELS.WORKSPACE_MIRROR_FETCH_RESOURCE,
+] as const;
+
+export type V1RemoteCommandChannel = (typeof V1_REMOTE_COMMAND_CHANNELS)[number];
+
+const v1RemoteCommandSet: ReadonlySet<string> = new Set(V1_REMOTE_COMMAND_CHANNELS);
+
+export function isV1RemoteCommandChannel(channel: string): channel is V1RemoteCommandChannel {
+  return v1RemoteCommandSet.has(channel);
+}
+
+/** A V1 channel is dispatchable only after its V2 migration route is classified. */
+export function isClassifiedRemoteCommandChannel(
+  channel: string
+): channel is V1RemoteCommandChannel {
+  return isV1RemoteCommandChannel(channel) && getRemoteCommandDescriptor(channel) !== undefined;
+}
+
+export interface RemoteCommandRegistry<Handler> {
+  /** Store a handler only when the channel is explicitly authorized. */
+  register(channel: string, handler: Handler): boolean;
+  remove(channel: string): void;
+  lookup(channel: string): Handler | undefined;
+}
+
+/**
+ * Electron-independent registry used by the host dispatcher.
+ *
+ * The predicate is injectable so protocol tests can exercise the registry
+ * without importing Electron or constructing an IPC event.
+ */
+export function createRemoteCommandRegistry<Handler>(
+  isAllowed: (channel: string) => boolean = isClassifiedRemoteCommandChannel
+): RemoteCommandRegistry<Handler> {
+  const handlers = new Map<string, Handler>();
+
+  return {
+    register(channel, handler): boolean {
+      if (!isAllowed(channel)) {
+        return false;
+      }
+      handlers.set(channel, handler);
+      return true;
+    },
+
+    remove(channel): void {
+      handlers.delete(channel);
+    },
+
+    lookup(channel): Handler | undefined {
+      if (!isAllowed(channel)) {
+        return undefined;
+      }
+      return handlers.get(channel);
+    },
+  };
+}

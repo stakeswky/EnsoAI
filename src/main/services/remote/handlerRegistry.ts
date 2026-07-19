@@ -1,12 +1,13 @@
 import { isRemoteForwardedChannel } from '@shared/types';
 import { type IpcMainInvokeEvent, ipcMain } from 'electron';
+import { createRemoteCommandRegistry } from './remoteCommandRegistry';
 
 /**
  * IPC handler registry + interceptor.
  *
  * Wraps `ipcMain.handle` so that:
- * 1. Every registered handler is recorded in a registry. The host-side
- *    RemoteHostServer dispatches incoming WS requests to these raw handlers.
+ * 1. Explicitly approved V1 handlers are recorded in a separate remote
+ *    command registry for host-side WebSocket dispatch.
  * 2. Handlers for remote-forwarded channels are wrapped: when the calling
  *    window is attached to a remote host, the invoke is forwarded over WS
  *    instead of executing locally.
@@ -17,13 +18,13 @@ import { type IpcMainInvokeEvent, ipcMain } from 'electron';
 export type IpcHandler = (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown;
 
 interface RemoteRouting {
-  /** Whether this webContents is attached to a remote host */
-  isAttached: (senderId: number) => boolean;
+  /** Whether this invoke should be routed to the attached remote host. */
+  shouldForward: (senderId: number, channel: string) => boolean;
   /** Forward an invoke to the remote host */
   forward: (senderId: number, channel: string, args: unknown[]) => Promise<unknown>;
 }
 
-const registeredHandlers = new Map<string, IpcHandler>();
+const remoteCommandHandlers = createRemoteCommandRegistry<IpcHandler>();
 let routing: RemoteRouting | null = null;
 let installed = false;
 
@@ -31,9 +32,9 @@ export function setRemoteRouting(r: RemoteRouting | null): void {
   routing = r;
 }
 
-/** Raw (unwrapped) handler lookup, used by the host server to dispatch requests */
+/** Approved raw handler lookup, used by the host server to dispatch requests. */
 export function getRegisteredHandler(channel: string): IpcHandler | undefined {
-  return registeredHandlers.get(channel);
+  return remoteCommandHandlers.lookup(channel);
 }
 
 export function installIpcInterceptor(): void {
@@ -46,7 +47,7 @@ export function installIpcInterceptor(): void {
   const originalRemoveHandler = ipcMain.removeHandler.bind(ipcMain);
 
   ipcMain.handle = (channel: string, handler: IpcHandler): void => {
-    registeredHandlers.set(channel, handler);
+    remoteCommandHandlers.register(channel, handler);
 
     if (!isRemoteForwardedChannel(channel)) {
       originalHandle(channel, handler);
@@ -54,7 +55,7 @@ export function installIpcInterceptor(): void {
     }
 
     originalHandle(channel, async (event: IpcMainInvokeEvent, ...args: unknown[]) => {
-      if (routing?.isAttached(event.sender.id)) {
+      if (routing?.shouldForward(event.sender.id, channel)) {
         return routing.forward(event.sender.id, channel, args);
       }
       return handler(event, ...args);
@@ -62,7 +63,7 @@ export function installIpcInterceptor(): void {
   };
 
   ipcMain.removeHandler = (channel: string): void => {
-    registeredHandlers.delete(channel);
+    remoteCommandHandlers.remove(channel);
     originalRemoveHandler(channel);
   };
 }

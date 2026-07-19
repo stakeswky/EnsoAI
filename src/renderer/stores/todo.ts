@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { subscribeWithSelector } from 'zustand/middleware';
 import { normalizePath, STORAGE_KEYS } from '@/App/storage';
 import type { AutoExecuteState, TaskStatus, TodoTask } from '@/components/todo/types';
+import { useWorkspaceMirrorStore } from './workspaceMirror';
 
 const EMPTY_TASKS: TodoTask[] = [];
 
@@ -17,10 +18,11 @@ interface TodoState {
 
   // Task Actions
   loadTasks: (repoPath: string) => Promise<void>;
+  loadTasksForMigration: (repoPath: string) => Promise<void>;
   addTask: (
     repoPath: string,
     task: Omit<TodoTask, 'id' | 'createdAt' | 'updatedAt' | 'order'>
-  ) => TodoTask;
+  ) => TodoTask | null;
   updateTask: (
     repoPath: string,
     taskId: string,
@@ -47,25 +49,75 @@ export const INITIAL_AUTO_EXECUTE: AutoExecuteState = {
   currentSessionId: null,
 };
 
-function getKey(repoPath: string): string {
+export function getTodoStoreKey(repoPath: string): string {
+  const mirror = useWorkspaceMirrorStore.getState();
+  if (mirror.projectionTarget === 'remote' && mirror.snapshot) {
+    const repository = Object.values(mirror.snapshot.catalog.repositories).find(
+      (candidate) => candidate.path === repoPath
+    );
+    if (repository) {
+      return `remote:${mirror.snapshot.hostId}:${mirror.snapshot.sceneId}:${repository.id}`;
+    }
+  }
   return normalizePath(repoPath);
 }
 
-/** One-time migration from localStorage to SQLite */
-async function migrateLocalStorage(): Promise<void> {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEYS.TODO_BOARDS);
-    if (!saved) return;
-    await window.electronAPI.todo.migrate(saved);
-    localStorage.removeItem(STORAGE_KEYS.TODO_BOARDS);
-    console.log('[TodoStore] Migrated localStorage data to SQLite');
-  } catch (err) {
-    console.error('[TodoStore] Migration failed:', err);
-  }
+/** Shared Todo writes require a live controller lease. */
+export function canMutateTodo(): boolean {
+  const mirror = useWorkspaceMirrorStore.getState();
+  return (
+    mirror.syncPhase === 'live' &&
+    mirror.projectionTarget !== 'transitioning' &&
+    mirror.ownsControl &&
+    mirror.bootstrapReady
+  );
 }
 
-// Run migration on module load
-migrateLocalStorage();
+function usesWorkspaceTodoAuthority(): boolean {
+  const mirror = useWorkspaceMirrorStore.getState();
+  // During target transitions, never fall back to the local compatibility DB.
+  return mirror.projectionTarget !== 'local' || mirror.bootstrapReady;
+}
+
+/** One-time migration from localStorage to SQLite */
+let localStorageMigration: Promise<void> | null = null;
+
+export function migrateTodoLocalStorage(): Promise<void> {
+  if (!localStorageMigration) {
+    const attempt = (async () => {
+      const saved = localStorage.getItem(STORAGE_KEYS.TODO_BOARDS);
+      if (!saved) return;
+      await window.electronAPI.todo.migrate(saved);
+      localStorage.removeItem(STORAGE_KEYS.TODO_BOARDS);
+      console.log('[TodoStore] Migrated localStorage data to SQLite');
+    })();
+    localStorageMigration = attempt.catch((error) => {
+      localStorageMigration = null;
+      throw error;
+    });
+  }
+  return localStorageMigration;
+}
+
+async function loadTasksFromAuthority(repoPath: string, force: boolean): Promise<void> {
+  const key = getTodoStoreKey(repoPath);
+  const state = useTodoStore.getState();
+  if (!force && state._loaded.has(key)) return;
+
+  const fetched = (await window.electronAPI.todo.getTasks(repoPath)) as TodoTask[];
+  useTodoStore.setState((current) => {
+    const existingById = new Map((current.tasks[key] ?? []).map((task) => [task.id, task]));
+    const tasks = fetched.map((task) => {
+      const existingSessionId = existingById.get(task.id)?.sessionId;
+      return task.sessionId || !existingSessionId
+        ? task
+        : { ...task, sessionId: existingSessionId };
+    });
+    const loaded = new Set(current._loaded);
+    loaded.add(key);
+    return { tasks: { ...current.tasks, [key]: tasks }, _loaded: loaded };
+  });
+}
 
 export const useTodoStore = create<TodoState>()(
   subscribeWithSelector((set, get) => ({
@@ -74,26 +126,20 @@ export const useTodoStore = create<TodoState>()(
     autoExecute: {},
 
     loadTasks: async (repoPath) => {
-      const key = getKey(repoPath);
-      if (get()._loaded.has(key)) return;
-
       try {
-        const tasks = (await window.electronAPI.todo.getTasks(key)) as TodoTask[];
-        set((state) => {
-          const newLoaded = new Set(state._loaded);
-          newLoaded.add(key);
-          return {
-            tasks: { ...state.tasks, [key]: tasks },
-            _loaded: newLoaded,
-          };
-        });
+        await loadTasksFromAuthority(repoPath, false);
       } catch (err) {
-        console.error('[TodoStore] Failed to load tasks for', key, err);
+        console.error('[TodoStore] Failed to load tasks for', getTodoStoreKey(repoPath), err);
       }
     },
 
+    loadTasksForMigration: async (repoPath) => {
+      await loadTasksFromAuthority(repoPath, true);
+    },
+
     addTask: (repoPath, taskData) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return null;
+      const key = getTodoStoreKey(repoPath);
       const existing = get().tasks[key] ?? [];
       const tasksInColumn = existing.filter((t) => t.status === taskData.status);
       const maxOrder = tasksInColumn.reduce((max, t) => Math.max(max, t.order), -1);
@@ -115,15 +161,18 @@ export const useTodoStore = create<TodoState>()(
       }));
 
       // Persist to SQLite
-      window.electronAPI.todo
-        .addTask(key, newTask)
-        .catch((err) => console.error('[TodoStore] addTask IPC failed:', err));
+      if (!usesWorkspaceTodoAuthority()) {
+        window.electronAPI.todo
+          .addTask(repoPath, newTask)
+          .catch((err) => console.error('[TodoStore] addTask IPC failed:', err));
+      }
 
       return newTask;
     },
 
     updateTask: (repoPath, taskId, updates) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return;
+      const key = getTodoStoreKey(repoPath);
       const existing = get().tasks[key];
       if (!existing) return;
 
@@ -137,13 +186,16 @@ export const useTodoStore = create<TodoState>()(
         },
       }));
 
-      window.electronAPI.todo
-        .updateTask(key, taskId, updates)
-        .catch((err) => console.error('[TodoStore] updateTask IPC failed:', err));
+      if (!usesWorkspaceTodoAuthority()) {
+        window.electronAPI.todo
+          .updateTask(repoPath, taskId, updates)
+          .catch((err) => console.error('[TodoStore] updateTask IPC failed:', err));
+      }
     },
 
     deleteTask: (repoPath, taskId) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return;
+      const key = getTodoStoreKey(repoPath);
       const existing = get().tasks[key];
       if (!existing) return;
 
@@ -154,13 +206,16 @@ export const useTodoStore = create<TodoState>()(
         },
       }));
 
-      window.electronAPI.todo
-        .deleteTask(key, taskId)
-        .catch((err) => console.error('[TodoStore] deleteTask IPC failed:', err));
+      if (!usesWorkspaceTodoAuthority()) {
+        window.electronAPI.todo
+          .deleteTask(repoPath, taskId)
+          .catch((err) => console.error('[TodoStore] deleteTask IPC failed:', err));
+      }
     },
 
     moveTask: (repoPath, taskId, newStatus, newOrder) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return;
+      const key = getTodoStoreKey(repoPath);
       const existing = get().tasks[key];
       if (!existing) return;
 
@@ -174,13 +229,16 @@ export const useTodoStore = create<TodoState>()(
         },
       }));
 
-      window.electronAPI.todo
-        .moveTask(key, taskId, newStatus, newOrder)
-        .catch((err) => console.error('[TodoStore] moveTask IPC failed:', err));
+      if (!usesWorkspaceTodoAuthority()) {
+        window.electronAPI.todo
+          .moveTask(repoPath, taskId, newStatus, newOrder)
+          .catch((err) => console.error('[TodoStore] moveTask IPC failed:', err));
+      }
     },
 
     reorderTasks: (repoPath, status, orderedIds) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return;
+      const key = getTodoStoreKey(repoPath);
       const existing = get().tasks[key];
       if (!existing) return;
 
@@ -198,14 +256,17 @@ export const useTodoStore = create<TodoState>()(
         },
       }));
 
-      window.electronAPI.todo
-        .reorderTasks(key, status, orderedIds)
-        .catch((err) => console.error('[TodoStore] reorderTasks IPC failed:', err));
+      if (!usesWorkspaceTodoAuthority()) {
+        window.electronAPI.todo
+          .reorderTasks(repoPath, status, orderedIds)
+          .catch((err) => console.error('[TodoStore] reorderTasks IPC failed:', err));
+      }
     },
 
     // Auto-Execute Actions
     startAutoExecute: (repoPath, taskIds) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return;
+      const key = getTodoStoreKey(repoPath);
 
       set((state) => ({
         autoExecute: {
@@ -221,7 +282,8 @@ export const useTodoStore = create<TodoState>()(
     },
 
     stopAutoExecute: (repoPath) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return;
+      const key = getTodoStoreKey(repoPath);
       set((state) => ({
         autoExecute: {
           ...state.autoExecute,
@@ -236,7 +298,8 @@ export const useTodoStore = create<TodoState>()(
     },
 
     setCurrentExecution: (repoPath, taskId, sessionId) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return;
+      const key = getTodoStoreKey(repoPath);
       set((state) => {
         const current = state.autoExecute[key];
         if (!current) return state;
@@ -254,7 +317,8 @@ export const useTodoStore = create<TodoState>()(
     },
 
     advanceQueue: (repoPath) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return null;
+      const key = getTodoStoreKey(repoPath);
       const current = get().autoExecute[key];
       if (!current || current.queue.length === 0) {
         // No more tasks, stop auto-execute
@@ -288,7 +352,8 @@ export const useTodoStore = create<TodoState>()(
     },
 
     reorderAutoExecuteQueue: (repoPath, fromIndex, toIndex) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return;
+      const key = getTodoStoreKey(repoPath);
       set((state) => {
         const current = state.autoExecute[key];
         if (!current) return state;
@@ -307,7 +372,8 @@ export const useTodoStore = create<TodoState>()(
     },
 
     removeFromAutoExecuteQueue: (repoPath, taskId) => {
-      const key = getKey(repoPath);
+      if (!canMutateTodo()) return;
+      const key = getTodoStoreKey(repoPath);
       set((state) => {
         const current = state.autoExecute[key];
         if (!current) return state;
@@ -328,12 +394,12 @@ export const useTodoStore = create<TodoState>()(
 
 /** Stable selector: returns cached EMPTY_TASKS when repo has no tasks */
 export function selectTasks(state: TodoState, repoPath: string): TodoTask[] {
-  const key = getKey(repoPath);
+  const key = getTodoStoreKey(repoPath);
   return state.tasks[key] ?? EMPTY_TASKS;
 }
 
 /** Selector: get auto-execute state for a repo */
 export function selectAutoExecute(state: TodoState, repoPath: string): AutoExecuteState {
-  const key = getKey(repoPath);
+  const key = getTodoStoreKey(repoPath);
   return state.autoExecute[key] ?? INITIAL_AUTO_EXECUTE;
 }

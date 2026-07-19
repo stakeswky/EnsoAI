@@ -87,7 +87,9 @@ function computeDerivedArrays(tasks: Record<string, AgentTask>) {
   );
   const completed = all.filter((t) => t.status === 'completed');
   const idle = all.filter((t) => t.status === 'idle');
-  const activeTaskCount = all.filter((t) => t.status !== 'completed').length;
+  const activeTaskCount = all.filter(
+    (task) => task.status !== 'completed' && task.status !== 'error'
+  ).length;
 
   return {
     _allTasksCache: all,
@@ -491,8 +493,23 @@ export function loadSnapshot(tasks: Record<string, AgentTask>): void {
   }
 
   const derived = computeDerivedArrays(tasks);
+  const entries = Object.entries(tasks);
   useAgentTasksStore.setState({
     tasks,
+    startTimes: Object.fromEntries(entries.map(([sessionId, task]) => [sessionId, task.startedAt])),
+    completionTimes: Object.fromEntries(
+      entries.flatMap(([sessionId, task]) =>
+        task.completedAt === undefined ? [] : [[sessionId, task.completedAt]]
+      )
+    ),
+    waitingReasons: Object.fromEntries(
+      entries.flatMap(([sessionId, task]) =>
+        task.waitingReason === undefined ? [] : [[sessionId, task.waitingReason]]
+      )
+    ),
+    descriptions: Object.fromEntries(
+      entries.map(([sessionId, task]) => [sessionId, task.description])
+    ),
     ...derived,
   });
 }

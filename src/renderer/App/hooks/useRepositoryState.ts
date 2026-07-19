@@ -1,6 +1,7 @@
 import { getPathBasename } from '@shared/utils/path';
 import { useCallback, useEffect, useState } from 'react';
 import { normalizeHexColor } from '@/lib/colors';
+import { isLocalWorkspaceProjection } from '@/stores/workspaceMirror';
 import {
   ALL_GROUP_ID,
   DEFAULT_GROUP_COLOR,
@@ -68,12 +69,15 @@ export function useRepositoryState() {
 
   // Save repositories to localStorage
   const saveRepositories = useCallback((repos: Repository[]) => {
-    localStorage.setItem(STORAGE_KEYS.REPOSITORIES, JSON.stringify(repos));
+    if (isLocalWorkspaceProjection()) {
+      localStorage.setItem(STORAGE_KEYS.REPOSITORIES, JSON.stringify(repos));
+    }
     setRepositories(repos);
   }, []);
 
   // Save selected repo to localStorage
   useEffect(() => {
+    if (!isLocalWorkspaceProjection()) return;
     if (selectedRepo) {
       localStorage.setItem(STORAGE_KEYS.SELECTED_REPO, selectedRepo);
     } else {
@@ -94,7 +98,7 @@ export function useRepositoryState() {
       };
       const updated = [...groups, newGroup];
       setGroups(updated);
-      saveGroups(updated);
+      if (isLocalWorkspaceProjection()) saveGroups(updated);
       return newGroup;
     },
     [groups]
@@ -107,7 +111,7 @@ export function useRepositoryState() {
         g.id === groupId ? { ...g, name: name.trim(), emoji, color: normalizedColor } : g
       );
       setGroups(updated);
-      saveGroups(updated);
+      if (isLocalWorkspaceProjection()) saveGroups(updated);
     },
     [groups]
   );
@@ -118,7 +122,7 @@ export function useRepositoryState() {
         .filter((g) => g.id !== groupId)
         .map((g, i) => ({ ...g, order: i }));
       setGroups(updatedGroups);
-      saveGroups(updatedGroups);
+      if (isLocalWorkspaceProjection()) saveGroups(updatedGroups);
 
       const updatedRepos = repositories.map((r) =>
         r.groupId === groupId ? { ...r, groupId: undefined } : r
@@ -127,7 +131,7 @@ export function useRepositoryState() {
 
       if (activeGroupId === groupId) {
         setActiveGroupId(ALL_GROUP_ID);
-        saveActiveGroupId(ALL_GROUP_ID);
+        if (isLocalWorkspaceProjection()) saveActiveGroupId(ALL_GROUP_ID);
       }
     },
     [groups, repositories, saveRepositories, activeGroupId]
@@ -135,7 +139,7 @@ export function useRepositoryState() {
 
   const handleSwitchGroup = useCallback((groupId: string) => {
     setActiveGroupId(groupId);
-    saveActiveGroupId(groupId);
+    if (isLocalWorkspaceProjection()) saveActiveGroupId(groupId);
   }, []);
 
   const handleMoveToGroup = useCallback(
@@ -157,15 +161,22 @@ export function useRepositoryState() {
       }
 
       const name = getPathBasename(path);
-      const newRepo: Repository = {
-        name,
-        path,
-        groupId: groupId || undefined,
-      };
-
-      const updated = [...repositories, newRepo];
-      saveRepositories(updated);
-      setSelectedRepo(path);
+      void window.electronAPI.workspaceMirror
+        .registerEntity('repository', path)
+        .then((reservation) => {
+          const newRepo: Repository = {
+            id: reservation.entityId,
+            name,
+            path: reservation.path,
+            groupId: groupId || undefined,
+          };
+          const updated = [...repositories, newRepo];
+          saveRepositories(updated);
+          setSelectedRepo(reservation.path);
+        })
+        .catch((error) => {
+          console.warn('[workspace-mirror] repository registration failed', error);
+        });
     },
     [repositories, saveRepositories]
   );
@@ -185,6 +196,8 @@ export function useRepositoryState() {
     selectedRepo,
     groups,
     activeGroupId,
+    setRepositories,
+    setGroups,
     setSelectedRepo,
     setActiveGroupId,
     saveRepositories,

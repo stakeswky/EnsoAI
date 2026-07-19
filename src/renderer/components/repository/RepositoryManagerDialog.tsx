@@ -1,11 +1,13 @@
 import { Eye, EyeOff, FolderGit2, Trash2 } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import type { Repository } from '@/App/constants';
 import {
   DEFAULT_REPOSITORY_SETTINGS,
   getRepositorySettings,
+  getRepositorySettingsRevision,
   type RepositorySettings,
   saveRepositorySettings,
+  subscribeRepositorySettings,
 } from '@/App/storage';
 import {
   AlertDialog,
@@ -27,6 +29,7 @@ import {
 } from '@/components/ui/dialog';
 import { useI18n } from '@/i18n';
 import { cn } from '@/lib/utils';
+import { useWorkspaceMirrorStore } from '@/stores/workspaceMirror';
 
 interface RepositoryManagerDialogProps {
   open: boolean;
@@ -50,9 +53,19 @@ export function RepositoryManagerDialog({
   const { t, tNode } = useI18n();
   const [settingsMap, setSettingsMap] = useState<Record<string, RepositorySettings>>({});
   const [repoToRemove, setRepoToRemove] = useState<Repository | null>(null);
+  const settingsRevision = useSyncExternalStore(
+    subscribeRepositorySettings,
+    getRepositorySettingsRevision
+  );
+  const canEdit = useWorkspaceMirrorStore(
+    (state) =>
+      state.projectionTarget !== 'transitioning' &&
+      (state.projectionTarget === 'local' || state.ownsControl)
+  );
 
   // Load settings for all repositories
   useEffect(() => {
+    void settingsRevision;
     if (open) {
       const map: Record<string, RepositorySettings> = {};
       for (const repo of repositories) {
@@ -60,7 +73,7 @@ export function RepositoryManagerDialog({
       }
       setSettingsMap(map);
     }
-  }, [open, repositories]);
+  }, [open, repositories, settingsRevision]);
 
   const toggleVisibility = useCallback(
     (repoPath: string) => {
@@ -143,6 +156,7 @@ export function RepositoryManagerDialog({
                         'hover:bg-accent text-muted-foreground hover:text-foreground'
                       )}
                       onClick={() => toggleVisibility(repo.path)}
+                      disabled={!canEdit}
                       title={isHidden ? t('Show Repository') : t('Hide Repository')}
                     >
                       {isHidden ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}

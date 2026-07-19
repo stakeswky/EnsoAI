@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
@@ -11,7 +12,9 @@ import {
   registerAllowedLocalFileRoot,
   unregisterAllowedLocalFileRootsByOwner,
 } from '../services/files/LocalFileAccess';
+import { validateBatchTargetName } from '../services/files/pathSafety';
 import { createSimpleGit, normalizeGitRelativePath } from '../services/git/runtime';
+import { getWorkspaceMirrorService } from '../services/workspace/workspaceMirrorRuntime';
 
 /**
  * Normalize encoding name to a consistent format
@@ -80,6 +83,8 @@ const watchers = new Map<string, FileWatcherEntry>();
 const ownerWatcherKeys = new Map<number, Set<string>>();
 const fileResourceOwners = new Set<number>();
 
+export const MAX_FILE_READ_BYTES = 16 * 1024 * 1024;
+
 function normalizeWatchedPath(inputPath: string): string {
   const normalizedPath = inputPath.replace(/\\/g, '/');
   if (process.platform === 'win32' || process.platform === 'darwin') {
@@ -123,7 +128,7 @@ async function stopWatcherEntry(key: string): Promise<void> {
   untrackWatcherKey(entry.ownerId, key);
 }
 
-async function stopFileWatchersForOwner(ownerId: number): Promise<void> {
+export async function stopFileWatchersForOwner(ownerId: number): Promise<void> {
   const keys = Array.from(ownerWatcherKeys.get(ownerId) ?? []);
   await Promise.all(keys.map((key) => stopWatcherEntry(key)));
 }
@@ -204,6 +209,14 @@ export function registerFileHandlers(): void {
   );
 
   ipcMain.handle(IPC_CHANNELS.FILE_READ, async (_, filePath: string): Promise<FileReadResult> => {
+    const fileStats = await stat(filePath);
+    if (!fileStats.isFile()) {
+      throw new Error('File read target must be a regular file');
+    }
+    if (fileStats.size > MAX_FILE_READ_BYTES) {
+      throw new Error('File exceeds the 16 MiB read limit');
+    }
+
     // Design Decision: Binary File Detection
     // ----------------------------------------
     // We detect binary files BEFORE reading the full content to avoid:
@@ -402,6 +415,19 @@ export function registerFileHandlers(): void {
           }
         }
 
+        const resourceKey = `file-tree:${createHash('sha256')
+          .update(dirPath)
+          .digest('hex')
+          .slice(0, 24)}`;
+        void getWorkspaceMirrorService()
+          .invalidateResource({
+            resourceKey,
+            domain: 'file-tree',
+            entityId: null,
+            reason: bulkMode ? 'reset' : 'changed',
+          })
+          .catch(() => undefined);
+
         pendingEvents.clear();
         bulkMode = false;
       }, FLUSH_DELAY_MS);
@@ -544,8 +570,8 @@ export function registerFileHandlers(): void {
             if (conflict.action === 'skip') {
               continue;
             }
-            if (conflict.action === 'rename' && conflict.newName) {
-              targetPath = join(targetDir, conflict.newName);
+            if (conflict.action === 'rename') {
+              targetPath = join(targetDir, validateBatchTargetName(conflict.newName));
             }
             // 'replace' action: just overwrite
           }
@@ -596,8 +622,8 @@ export function registerFileHandlers(): void {
             if (conflict.action === 'skip') {
               continue;
             }
-            if (conflict.action === 'rename' && conflict.newName) {
-              targetPath = join(targetDir, conflict.newName);
+            if (conflict.action === 'rename') {
+              targetPath = join(targetDir, validateBatchTargetName(conflict.newName));
             }
             // 'replace' action: delete existing first
             if (conflict.action === 'replace') {

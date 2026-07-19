@@ -16,7 +16,7 @@ import { matchesKeybinding } from '@/lib/keybinding';
 import { cn } from '@/lib/utils';
 import { useInitScriptStore } from '@/stores/initScript';
 import { useSettingsStore } from '@/stores/settings';
-import { useTerminalStore } from '@/stores/terminal';
+import { createInitialTerminalGroupState, useTerminalStore } from '@/stores/terminal';
 import { useWorktreeActivityStore } from '@/stores/worktreeActivity';
 import { ResizeHandle } from './ResizeHandle';
 import { ShellTerminal } from './ShellTerminal';
@@ -30,31 +30,10 @@ interface TerminalPanelProps {
   isActive?: boolean;
 }
 
-interface GroupState {
-  groups: TerminalGroupType[];
-  activeGroupId: string | null;
-  // Flex percentages for each group
-  flexPercents: number[];
-  // Original path with correct case (used for terminal cwd)
-  // Optional in interface because updateCurrentState auto-fills it
-  originalPath?: string;
-}
-
-function createInitialGroupState(originalPath = ''): GroupState {
-  return {
-    groups: [],
-    activeGroupId: null,
-    flexPercents: [],
-    originalPath,
-  };
-}
-
-// Per-worktree state
-type WorktreeGroupStates = Record<string, GroupState>;
-
 export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanelProps) {
   const { t } = useI18n();
-  const [worktreeStates, setWorktreeStates] = useState<WorktreeGroupStates>({});
+  const worktreeStates = useTerminalStore((state) => state.worktreeGroupStates);
+  const setWorktreeStates = useTerminalStore((state) => state.setWorktreeGroupStates);
   // Global terminal IDs to keep terminals mounted across group moves
   const [globalTerminalIds, setGlobalTerminalIds] = useState<Set<string>>(new Set());
   const xtermKeybindings = useSettingsStore((state) => state.xtermKeybindings);
@@ -75,17 +54,20 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
   const syncTerminalSessions = useTerminalStore((s) => s.syncSessions);
   const { pendingScript, clearPendingScript } = useInitScriptStore();
   const pendingScriptProcessedRef = useRef<string | null>(null);
+  const destroyTerminalSession = useCallback((sessionId: string) => {
+    void window.electronAPI.terminal.destroy(sessionId).catch(() => undefined);
+  }, []);
 
   // Get current worktree's state
   const currentState = useMemo(() => {
-    if (!cwd) return createInitialGroupState();
+    if (!cwd) return createInitialTerminalGroupState();
     const normalizedCwd = normalizePath(cwd);
     const existingState = worktreeStates[normalizedCwd];
     if (existingState) {
       // Update originalPath if cwd has changed (in case of case difference)
       return { ...existingState, originalPath: cleanPath(cwd) };
     }
-    return createInitialGroupState(cleanPath(cwd));
+    return createInitialTerminalGroupState(cleanPath(cwd));
   }, [cwd, worktreeStates]);
 
   const { groups, activeGroupId } = currentState;
@@ -147,16 +129,20 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
     };
 
     return registerTerminalCloseHandler(handleCloseAll);
-  }, [registerTerminalCloseHandler, setTerminalCount]);
+  }, [registerTerminalCloseHandler, setTerminalCount, setWorktreeStates]);
 
   // Update state helper
   const updateCurrentState = useCallback(
-    (updater: (state: GroupState) => GroupState) => {
+    (
+      updater: (
+        state: ReturnType<typeof createInitialTerminalGroupState>
+      ) => ReturnType<typeof createInitialTerminalGroupState>
+    ) => {
       if (!cwd) return;
       const normalizedCwd = normalizePath(cwd);
       const cleanedCwd = cleanPath(cwd);
       setWorktreeStates((prev) => {
-        const currentState = prev[normalizedCwd] || createInitialGroupState(cleanedCwd);
+        const currentState = prev[normalizedCwd] || createInitialTerminalGroupState(cleanedCwd);
         const newState = updater(currentState);
         // Ensure originalPath is always preserved
         return {
@@ -168,7 +154,7 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
         };
       });
     },
-    [cwd]
+    [cwd, setWorktreeStates]
   );
 
   // Handle tab changes within a group (searches all worktrees for the group)
@@ -193,7 +179,7 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
         return prev;
       });
     },
-    []
+    [setWorktreeStates]
   );
 
   // Handle group activation
@@ -208,96 +194,103 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
   );
 
   // Handle terminal title change
-  const handleTitleChange = useCallback((tabId: string, title: string) => {
-    setWorktreeStates((prev) => {
-      // Find which worktree and group contains this tab
-      for (const [path, state] of Object.entries(prev)) {
-        for (const group of state.groups) {
-          const tab = group.tabs.find((t) => t.id === tabId);
-          if (tab) {
-            return {
-              ...prev,
-              [path]: {
-                ...state,
-                groups: state.groups.map((g) =>
-                  g.id === group.id
-                    ? {
-                        ...g,
-                        tabs: g.tabs.map((t) => (t.id === tabId ? { ...t, title } : t)),
-                      }
-                    : g
-                ),
-              },
-            };
+  const handleTitleChange = useCallback(
+    (tabId: string, title: string) => {
+      setWorktreeStates((prev) => {
+        // Find which worktree and group contains this tab
+        for (const [path, state] of Object.entries(prev)) {
+          for (const group of state.groups) {
+            const tab = group.tabs.find((t) => t.id === tabId);
+            if (tab) {
+              return {
+                ...prev,
+                [path]: {
+                  ...state,
+                  groups: state.groups.map((g) =>
+                    g.id === group.id
+                      ? {
+                          ...g,
+                          tabs: g.tabs.map((t) => (t.id === tabId ? { ...t, title } : t)),
+                        }
+                      : g
+                  ),
+                },
+              };
+            }
           }
         }
-      }
-      return prev;
-    });
-  }, []);
+        return prev;
+      });
+    },
+    [setWorktreeStates]
+  );
 
   // Handle terminal close
-  const handleTerminalClose = useCallback((tabId: string) => {
-    setWorktreeStates((prev) => {
-      // Find which worktree and group contains this tab
-      for (const [path, state] of Object.entries(prev)) {
-        for (const group of state.groups) {
-          const tabIndex = group.tabs.findIndex((t) => t.id === tabId);
-          if (tabIndex !== -1) {
-            const newTabs = group.tabs.filter((t) => t.id !== tabId);
+  const handleTerminalClose = useCallback(
+    (tabId: string) => {
+      destroyTerminalSession(tabId);
+      setWorktreeStates((prev) => {
+        // Find which worktree and group contains this tab
+        for (const [path, state] of Object.entries(prev)) {
+          for (const group of state.groups) {
+            const tabIndex = group.tabs.findIndex((t) => t.id === tabId);
+            if (tabIndex !== -1) {
+              const newTabs = group.tabs.filter((t) => t.id !== tabId);
 
-            // If group becomes empty, remove it
-            if (newTabs.length === 0) {
-              const newGroups = state.groups.filter((g) => g.id !== group.id);
+              // If group becomes empty, remove it
+              if (newTabs.length === 0) {
+                const newGroups = state.groups.filter((g) => g.id !== group.id);
 
-              if (newGroups.length === 0) {
-                // Remove worktree state entirely
-                const newStates = { ...prev };
-                delete newStates[path];
-                return newStates;
+                if (newGroups.length === 0) {
+                  // Remove worktree state entirely
+                  const newStates = { ...prev };
+                  delete newStates[path];
+                  return newStates;
+                }
+
+                const newFlexPercents = newGroups.map(() => 100 / newGroups.length);
+                let newActiveGroupId = state.activeGroupId;
+                if (state.activeGroupId === group.id) {
+                  const removedIndex = state.groups.findIndex((g) => g.id === group.id);
+                  const newIndex = Math.min(removedIndex, newGroups.length - 1);
+                  newActiveGroupId = newGroups[newIndex]?.id || null;
+                }
+
+                return {
+                  ...prev,
+                  [path]: {
+                    ...state,
+                    groups: newGroups,
+                    activeGroupId: newActiveGroupId,
+                    flexPercents: newFlexPercents,
+                  },
+                };
               }
 
-              const newFlexPercents = newGroups.map(() => 100 / newGroups.length);
-              let newActiveGroupId = state.activeGroupId;
-              if (state.activeGroupId === group.id) {
-                const removedIndex = state.groups.findIndex((g) => g.id === group.id);
-                const newIndex = Math.min(removedIndex, newGroups.length - 1);
-                newActiveGroupId = newGroups[newIndex]?.id || null;
+              // Update active tab if needed
+              let newActiveTabId = group.activeTabId;
+              if (group.activeTabId === tabId) {
+                const newIndex = Math.min(tabIndex, newTabs.length - 1);
+                newActiveTabId = newTabs[newIndex].id;
               }
 
               return {
                 ...prev,
                 [path]: {
                   ...state,
-                  groups: newGroups,
-                  activeGroupId: newActiveGroupId,
-                  flexPercents: newFlexPercents,
+                  groups: state.groups.map((g) =>
+                    g.id === group.id ? { ...g, tabs: newTabs, activeTabId: newActiveTabId } : g
+                  ),
                 },
               };
             }
-
-            // Update active tab if needed
-            let newActiveTabId = group.activeTabId;
-            if (group.activeTabId === tabId) {
-              const newIndex = Math.min(tabIndex, newTabs.length - 1);
-              newActiveTabId = newTabs[newIndex].id;
-            }
-
-            return {
-              ...prev,
-              [path]: {
-                ...state,
-                groups: state.groups.map((g) =>
-                  g.id === group.id ? { ...g, tabs: newTabs, activeTabId: newActiveTabId } : g
-                ),
-              },
-            };
           }
         }
-      }
-      return prev;
-    });
-  }, []);
+        return prev;
+      });
+    },
+    [destroyTerminalSession, setWorktreeStates]
+  );
 
   // Handle split - create new group to the right
   // If source group has multiple tabs, move the active tab to new group
@@ -428,46 +421,49 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
   );
 
   // Handle group becoming empty - remove it (searches all worktrees)
-  const handleGroupEmpty = useCallback((groupId: string) => {
-    setWorktreeStates((prev) => {
-      // Find which worktree contains this group
-      for (const [path, state] of Object.entries(prev)) {
-        const groupIndex = state.groups.findIndex((g) => g.id === groupId);
-        if (groupIndex !== -1) {
-          const newGroups = state.groups.filter((g) => g.id !== groupId);
+  const handleGroupEmpty = useCallback(
+    (groupId: string) => {
+      setWorktreeStates((prev) => {
+        // Find which worktree contains this group
+        for (const [path, state] of Object.entries(prev)) {
+          const groupIndex = state.groups.findIndex((g) => g.id === groupId);
+          if (groupIndex !== -1) {
+            const newGroups = state.groups.filter((g) => g.id !== groupId);
 
-          if (newGroups.length === 0) {
-            // Remove this worktree's state entirely
-            const newStates = { ...prev };
-            delete newStates[path];
-            return newStates;
+            if (newGroups.length === 0) {
+              // Remove this worktree's state entirely
+              const newStates = { ...prev };
+              delete newStates[path];
+              return newStates;
+            }
+
+            // Recalculate flex percentages
+            const newFlexPercents = newGroups.map(() => 100 / newGroups.length);
+
+            // Update active group if needed
+            let newActiveGroupId = state.activeGroupId;
+            if (state.activeGroupId === groupId) {
+              const removedIndex = state.groups.findIndex((g) => g.id === groupId);
+              const newIndex = Math.min(removedIndex, newGroups.length - 1);
+              newActiveGroupId = newGroups[newIndex]?.id || null;
+            }
+
+            return {
+              ...prev,
+              [path]: {
+                ...state,
+                groups: newGroups,
+                activeGroupId: newActiveGroupId,
+                flexPercents: newFlexPercents,
+              },
+            };
           }
-
-          // Recalculate flex percentages
-          const newFlexPercents = newGroups.map(() => 100 / newGroups.length);
-
-          // Update active group if needed
-          let newActiveGroupId = state.activeGroupId;
-          if (state.activeGroupId === groupId) {
-            const removedIndex = state.groups.findIndex((g) => g.id === groupId);
-            const newIndex = Math.min(removedIndex, newGroups.length - 1);
-            newActiveGroupId = newGroups[newIndex]?.id || null;
-          }
-
-          return {
-            ...prev,
-            [path]: {
-              ...state,
-              groups: newGroups,
-              activeGroupId: newActiveGroupId,
-              flexPercents: newFlexPercents,
-            },
-          };
         }
-      }
-      return prev;
-    });
-  }, []);
+        return prev;
+      });
+    },
+    [setWorktreeStates]
+  );
 
   // Handle moving a tab between groups
   const handleTabMoveToGroup = useCallback(
@@ -635,6 +631,7 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
         e.preventDefault();
         const activeGroup = groups.find((g) => g.id === activeGroupId);
         if (activeGroup?.activeTabId) {
+          destroyTerminalSession(activeGroup.activeTabId);
           const newTabs = activeGroup.tabs.filter((t) => t.id !== activeGroup.activeTabId);
           if (newTabs.length === 0) {
             handleGroupEmpty(activeGroup.id);
@@ -693,6 +690,7 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
     handleNewTerminal,
     handleTabsChange,
     handleGroupEmpty,
+    destroyTerminalSession,
   ]);
 
   const shouldAutoCreateSession =
@@ -809,7 +807,7 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
   };
 
   // Calculate cumulative left positions for groups
-  const getGroupPositions = (state: GroupState) => {
+  const getGroupPositions = (state: ReturnType<typeof createInitialTerminalGroupState>) => {
     const positions: { left: number; width: number }[] = [];
     let cumulative = 0;
     for (const percent of state.flexPercents) {
@@ -874,6 +872,7 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
                     onTabsChange={handleTabsChange}
                     onGroupClick={() => handleGroupClick(group.id)}
                     onGroupEmpty={handleGroupEmpty}
+                    onTabClose={destroyTerminalSession}
                     onTabMoveToGroup={handleTabMoveToGroup}
                   />
                 </div>
@@ -937,6 +936,7 @@ export function TerminalPanel({ repoPath, cwd, isActive = false }: TerminalPanel
                     }}
                   >
                     <ShellTerminal
+                      sessionId={tabId}
                       cwd={info.tab.cwd}
                       isActive={isTerminalActive}
                       canMerge={state.groups.length > 1}

@@ -74,6 +74,9 @@ export function AddRepositoryDialog({
   const { t } = useI18n();
   const hideGroups = useSettingsStore((s) => s.hideGroups);
   const gitClone = useSettingsStore((s) => s.gitClone);
+  const remoteAttached = useRemoteAttached();
+  const effectiveEnv = useEffectiveEnv();
+  const remoteRepositoryBase = [effectiveEnv.home, 'ensoai', 'repos'].join(effectiveEnv.pathSep);
 
   // Progress stage display labels (使用 t() 支持国际化，useMemo 避免重复创建)
   const stageLabels = React.useMemo<Record<string, string>>(
@@ -175,9 +178,10 @@ export function AddRepositoryDialog({
           // Auto-generate target directory using gitClone settings
           const { targetDir: autoTargetDir } = generateClonePath(
             remoteUrl.trim(),
-            gitClone.baseDir,
-            gitClone.hostMappings,
-            gitClone.useOrganizedStructure
+            remoteAttached ? remoteRepositoryBase : gitClone.baseDir,
+            remoteAttached ? [] : gitClone.hostMappings,
+            gitClone.useOrganizedStructure,
+            effectiveEnv.pathSep
           );
 
           // Only auto-fill if user hasn't manually set a target directory
@@ -193,7 +197,7 @@ export function AddRepositoryDialog({
     // Debounce validation
     const timer = setTimeout(validateUrl, 300);
     return () => clearTimeout(timer);
-  }, [remoteUrl, gitClone]);
+  }, [remoteUrl, gitClone, remoteAttached, effectiveEnv.pathSep, remoteRepositoryBase]);
 
   // Sync progress from store to local state for UI display
   React.useEffect(() => {
@@ -246,8 +250,6 @@ export function AddRepositoryDialog({
   }, []);
 
   // Remote development: browse the host's filesystem instead of the local one
-  const remoteAttached = useRemoteAttached();
-  const effectiveEnv = useEffectiveEnv();
   const [remotePickerTarget, setRemotePickerTarget] = React.useState<'local' | 'target' | null>(
     null
   );
@@ -355,6 +357,7 @@ export function AddRepositoryDialog({
       setCloneProgress(null);
 
       try {
+        await window.electronAPI.workspaceMirror.registerEntity('repository', fullPath);
         const result = await window.electronAPI.git.clone(remoteUrl.trim(), fullPath);
         if (result.success) {
           completeCloneTask(taskId);
@@ -756,7 +759,9 @@ export function AddRepositoryDialog({
         }}
         onSelect={handleRemotePickerSelect}
         initialPath={
-          remotePickerTarget === 'local' ? localPath || undefined : targetDir || undefined
+          remotePickerTarget === 'local'
+            ? localPath || remoteRepositoryBase
+            : targetDir || remoteRepositoryBase
         }
       />
     </Dialog>

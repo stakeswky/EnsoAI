@@ -25,7 +25,7 @@ export interface EffectiveEnv {
   home: string;
   platform: 'darwin' | 'win32' | 'linux';
   /** Path separator matching `platform` */
-  pathSep: string;
+  pathSep: '/' | '\\';
 }
 
 function toEffectiveEnv(status: RemoteClientStatus | null): EffectiveEnv {

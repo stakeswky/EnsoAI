@@ -45,6 +45,7 @@ import { Input } from '@/components/ui/input';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useI18n } from '@/i18n';
 import { Z_INDEX } from '@/lib/z-index';
+import { useEffectiveEnv, useRemoteAttached } from '@/stores/remote';
 import { useSettingsStore } from '@/stores/settings';
 
 // Get display name for branch (remove remotes/ prefix for remote branches)
@@ -78,6 +79,8 @@ export function CreateWorktreeDialog({
 }: CreateWorktreeDialogProps) {
   const { t } = useI18n();
   const { defaultWorktreePath, branchNameGenerator, aiPerformance } = useSettingsStore();
+  const effectiveEnv = useEffectiveEnv();
+  const remoteAttached = useRemoteAttached();
 
   // Internal state (for uncontrolled mode)
   const [internalOpen, setInternalOpen] = React.useState(false);
@@ -122,9 +125,7 @@ export function CreateWorktreeDialog({
 
   // Worktree path: {defaultWorktreePath}/{projectName}/{branchName}
   // Falls back to ~/ensoai/workspaces if not configured
-  const home = window.electronAPI?.env?.HOME || '';
-  const isWindows = window.electronAPI?.env?.platform === 'win32';
-  const pathSep = isWindows ? '\\' : '/';
+  const { home, pathSep } = effectiveEnv;
   const getWorktreePath = (branchName: string) => {
     if (!home) return '';
     // Extract last directory name from projectName when a full path is passed in.
@@ -132,7 +133,10 @@ export function CreateWorktreeDialog({
     const projectBaseName = normalizedName.split('/').filter(Boolean).pop() || projectName;
 
     // Use configured path or default to ~/ensoai/workspaces
-    const basePath = defaultWorktreePath || [home, 'ensoai', 'workspaces'].join(pathSep);
+    const basePath =
+      !remoteAttached && defaultWorktreePath
+        ? defaultWorktreePath
+        : [home, 'ensoai', 'workspaces'].join(pathSep);
     return [basePath, projectBaseName, branchName].join(pathSep);
   };
 
@@ -266,6 +270,14 @@ export function CreateWorktreeDialog({
     };
   }, [branchConflict, workdir]);
 
+  const submitRegisteredWorktree = React.useCallback(
+    async (options: WorktreeCreateOptions) => {
+      await window.electronAPI.workspaceMirror.registerEntity('worktree', options.path);
+      await onSubmit(options);
+    },
+    [onSubmit]
+  );
+
   // PR items for combobox
   type PrItem = { id: string; label: string; value: PullRequest };
   const prItems = React.useMemo((): PrItem[] => {
@@ -300,7 +312,7 @@ export function CreateWorktreeDialog({
 
       const targetPath = getWorktreePath(newBranchName);
       try {
-        await onSubmit({
+        await submitRegisteredWorktree({
           path: targetPath,
           branch: effectiveBaseBranch,
           newBranch: newBranchName,
@@ -339,7 +351,7 @@ export function CreateWorktreeDialog({
         await window.electronAPI.git.fetchPullRequest(workdir, selectedPr.number, branchName);
 
         // Then create worktree from that branch (branch already exists, no newBranch needed)
-        await onSubmit({
+        await submitRegisteredWorktree({
           path: getWorktreePath(branchName),
           branch: branchName,
         });
@@ -433,7 +445,7 @@ export function CreateWorktreeDialog({
     if (!branchConflict) return;
     setReusing(true);
     try {
-      await onSubmit({
+      await submitRegisteredWorktree({
         path: branchConflict.path,
         branch: branchConflict.branchName,
       });

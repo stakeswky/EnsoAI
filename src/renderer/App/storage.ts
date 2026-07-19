@@ -1,4 +1,5 @@
 import { normalizeHexColor } from '@/lib/colors';
+import { useWorkspaceMirrorStore } from '@/stores/workspaceMirror';
 import {
   ALL_GROUP_ID,
   DEFAULT_GROUP_COLOR,
@@ -204,7 +205,41 @@ export const DEFAULT_REPOSITORY_SETTINGS: RepositorySettings = {
   hidden: false,
 };
 
+let projectedRepositorySettings: Record<string, RepositorySettings> | null = null;
+let repositorySettingsRevision = 0;
+const repositorySettingsListeners = new Set<() => void>();
+
+function cloneRepositorySettingsMap(
+  settings: Record<string, RepositorySettings>
+): Record<string, RepositorySettings> {
+  return Object.fromEntries(Object.entries(settings).map(([path, value]) => [path, { ...value }]));
+}
+
+function notifyRepositorySettingsChanged(): void {
+  repositorySettingsRevision += 1;
+  for (const listener of repositorySettingsListeners) listener();
+}
+
+export function getRepositorySettingsRevision(): number {
+  return repositorySettingsRevision;
+}
+
+export function subscribeRepositorySettings(listener: () => void): () => void {
+  repositorySettingsListeners.add(listener);
+  return () => repositorySettingsListeners.delete(listener);
+}
+
+export function projectRepositorySettings(
+  settings: Record<string, RepositorySettings> | null
+): void {
+  projectedRepositorySettings = settings ? cloneRepositorySettingsMap(settings) : null;
+  notifyRepositorySettingsChanged();
+}
+
 export const getStoredRepositorySettings = (): Record<string, RepositorySettings> => {
+  if (projectedRepositorySettings) {
+    return cloneRepositorySettingsMap(projectedRepositorySettings);
+  }
   const saved = localStorage.getItem(STORAGE_KEYS.REPOSITORY_SETTINGS);
   if (saved) {
     try {
@@ -219,14 +254,30 @@ export const getStoredRepositorySettings = (): Record<string, RepositorySettings
 export const getRepositorySettings = (repoPath: string): RepositorySettings => {
   const allSettings = getStoredRepositorySettings();
   const normalizedPath = normalizePath(repoPath);
-  return allSettings[normalizedPath] || DEFAULT_REPOSITORY_SETTINGS;
+  return { ...(allSettings[normalizedPath] || DEFAULT_REPOSITORY_SETTINGS) };
 };
 
 export const saveRepositorySettings = (repoPath: string, settings: RepositorySettings): void => {
-  const allSettings = getStoredRepositorySettings();
   const normalizedPath = normalizePath(repoPath);
+  if (projectedRepositorySettings) {
+    const mirror = useWorkspaceMirrorStore.getState();
+    if (
+      mirror.projectionTarget === 'transitioning' ||
+      (mirror.projectionTarget === 'remote' && !mirror.ownsControl)
+    ) {
+      return;
+    }
+    projectedRepositorySettings = {
+      ...projectedRepositorySettings,
+      [normalizedPath]: { ...settings },
+    };
+    notifyRepositorySettingsChanged();
+    return;
+  }
+  const allSettings = getStoredRepositorySettings();
   allSettings[normalizedPath] = settings;
   localStorage.setItem(STORAGE_KEYS.REPOSITORY_SETTINGS, JSON.stringify(allSettings));
+  notifyRepositorySettingsChanged();
 };
 
 export const getStoredGroups = (): RepositoryGroup[] => {

@@ -36,6 +36,15 @@ const execAsync = promisify(exec);
 const MAX_GIT_STATUS_ENTRIES = 5000;
 const MAX_GIT_FILE_CHANGES = 5000;
 const GIT_STATUS_STREAM_TIMEOUT_MS = 15000;
+const GIT_OBJECT_ID_PATTERN = /^[a-f0-9]{4,64}$/i;
+
+function requireGitObjectId(value: string): string {
+  const objectId = value.trim();
+  if (!GIT_OBJECT_ID_PATTERN.test(objectId)) {
+    throw new Error('Invalid Git object ID');
+  }
+  return objectId;
+}
 
 type PorcelainBranchInfo = {
   current: string | null;
@@ -750,12 +759,12 @@ export class GitService {
   }
 
   async showCommit(hash: string): Promise<string> {
-    return this.git.show([hash, '--pretty=format:%H%n%an%n%ae%n%ad%n%s%n%b', '--stat']);
+    const objectId = requireGitObjectId(hash);
+    return this.git.show([objectId, '--pretty=format:%H%n%an%n%ae%n%ad%n%s%n%b', '--stat']);
   }
 
   async getCommitFiles(hash: string, submodulePath?: string): Promise<CommitFileChange[]> {
-    // Trim hash to remove any whitespace/newlines that may be passed from IPC layer
-    const trimmedHash = hash.trim();
+    const trimmedHash = requireGitObjectId(hash);
     const git = this.getGitInstance(submodulePath);
 
     // Use cat-file to reliably detect merge commits (check parent count)
@@ -832,11 +841,12 @@ export class GitService {
     status?: FileChangeStatus,
     submodulePath?: string
   ): Promise<FileDiff> {
+    const objectId = requireGitObjectId(hash);
     const git = this.getGitInstance(submodulePath);
 
     // Detect binary using git diff --numstat (binary files show "-" for insertions/deletions)
     try {
-      const numstat = await git.diff(['--numstat', `${hash}^..${hash}`, '--', filePath]);
+      const numstat = await git.diff(['--numstat', `${objectId}^..${objectId}`, '--', filePath]);
       if (numstat.startsWith('-\t-\t')) {
         return { path: filePath, original: '', modified: '', isBinary: true };
       }
@@ -850,17 +860,17 @@ export class GitService {
     // Handle different file statuses
     if (status === 'A') {
       // Added file: original is empty, get from current commit
-      modifiedContent = await git.show([`${hash}:${filePath}`]).catch(() => '');
+      modifiedContent = await git.show([`${objectId}:${filePath}`]).catch(() => '');
       originalContent = '';
     } else if (status === 'D') {
       // Deleted file: modified is empty, get from parent commit
-      originalContent = await git.show([`${hash}^:${filePath}`]).catch(() => '');
+      originalContent = await git.show([`${objectId}^:${filePath}`]).catch(() => '');
       modifiedContent = '';
     } else {
       // Modified or other: get from both parent and current commit
-      const parentHash = `${hash}^`;
+      const parentHash = `${objectId}^`;
       originalContent = await git.show([`${parentHash}:${filePath}`]).catch(() => '');
-      modifiedContent = await git.show([`${hash}:${filePath}`]).catch(() => '');
+      modifiedContent = await git.show([`${objectId}:${filePath}`]).catch(() => '');
     }
 
     return {

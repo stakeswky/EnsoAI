@@ -16,6 +16,7 @@ export { useSettingsEvents } from './useSettingsEvents';
 export { useSettingsState } from './useSettingsState';
 export { useTempWorkspaceSync } from './useTempWorkspaceSync';
 export { useTerminalNavigation } from './useTerminalNavigation';
+export { useWorkspaceMirrorBridge } from './useWorkspaceMirrorBridge';
 export { useWorktreeSelection } from './useWorktreeSelection';
 export { useWorktreeState } from './useWorktreeState';
 export { useWorktreeSync } from './useWorktreeSync';

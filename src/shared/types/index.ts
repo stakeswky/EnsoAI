@@ -15,4 +15,5 @@ export * from './search';
 export * from './shell';
 export * from './tempWorkspace';
 export * from './terminal';
+export * from './workspaceMirror';
 export * from './worktree';

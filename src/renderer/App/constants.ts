@@ -60,6 +60,8 @@ export interface RepositoryGroup {
 
 // Repository type
 export interface Repository {
+  /** Host-issued opaque identity. Path-only legacy records are resolved before scene publication. */
+  id?: string;
   name: string;
   path: string;
   /** 所属分组 ID，undefined = 仅在「全部」中显示 */

@@ -10,6 +10,7 @@ import type {
   ConflictResolution,
   ContentSearchParams,
   ContentSearchResult,
+  ControllerLease,
   CustomAgent,
   DetectedApp,
   FileChange,
@@ -39,15 +40,30 @@ import type {
   RemoteConnectOptions,
   RemoteHostSettings,
   RemoteHostStatus,
+  RemotePairedDeviceInfo,
   ShellConfig,
   ShellInfo,
+  StateIntentResultFrame,
   TempWorkspaceCheckResult,
   TempWorkspaceCreateResult,
   TempWorkspaceRemoveResult,
+  TerminalAttachOptions,
+  TerminalAttachResult,
   TerminalCreateOptions,
+  TerminalPersistentSessionInfo,
   TerminalResizeOptions,
+  TerminalStreamReset,
   ValidateLocalPathResult,
   ValidateUrlResult,
+  WorkspaceEntityAdoptionResult,
+  WorkspaceEntityKind,
+  WorkspaceEntityLookup,
+  WorkspaceEntityReservation,
+  WorkspaceEntityResolution,
+  WorkspaceResourceReference,
+  WorkspaceSceneEvent,
+  WorkspaceSceneIntent,
+  WorkspaceSceneSnapshot,
   WorktreeCreateOptions,
   WorktreeMergeCleanupOptions,
   WorktreeMergeOptions,
@@ -402,10 +418,18 @@ const electronAPI = {
     resize: (id: string, size: TerminalResizeOptions): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_RESIZE, id, size),
     destroy: (id: string): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_DESTROY, id),
+    attach: (id: string, options?: TerminalAttachOptions): Promise<TerminalAttachResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_ATTACH, id, options),
+    detach: (id: string): Promise<boolean> => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_DETACH, id),
+    listPersistent: (): Promise<TerminalPersistentSessionInfo[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_LIST_PERSISTENT),
     getActivity: (id: string): Promise<boolean> =>
       ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_GET_ACTIVITY, id),
-    onData: (callback: (event: { id: string; data: string }) => void): (() => void) => {
-      const handler = (_: unknown, event: { id: string; data: string }) => callback(event);
+    onData: (
+      callback: (event: { id: string; data: string; streamSeq?: number }) => void
+    ): (() => void) => {
+      const handler = (_: unknown, event: { id: string; data: string; streamSeq?: number }) =>
+        callback(event);
       ipcRenderer.on(IPC_CHANNELS.TERMINAL_DATA, handler);
       return () => ipcRenderer.off(IPC_CHANNELS.TERMINAL_DATA, handler);
     },
@@ -416,6 +440,14 @@ const electronAPI = {
         callback(event);
       ipcRenderer.on(IPC_CHANNELS.TERMINAL_EXIT, handler);
       return () => ipcRenderer.off(IPC_CHANNELS.TERMINAL_EXIT, handler);
+    },
+    onStreamReset: (callback: (event: TerminalStreamReset) => void): (() => void) => {
+      const handler = (_: unknown, event: TerminalStreamReset) => callback(event);
+      ipcRenderer.on(IPC_CHANNELS.TERMINAL_STREAM_RESET, handler);
+      return () => ipcRenderer.off(IPC_CHANNELS.TERMINAL_STREAM_RESET, handler);
+    },
+    ackStream: (id: string, payload: { streamSeq: number; creditBytes: number }): void => {
+      ipcRenderer.send(IPC_CHANNELS.TERMINAL_STREAM_ACK, id, payload);
     },
   },
 
@@ -628,6 +660,12 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.REMOTE_HOST_GET_STATUS),
     regenerateToken: (): Promise<RemoteHostStatus> =>
       ipcRenderer.invoke(IPC_CHANNELS.REMOTE_HOST_REGENERATE_TOKEN),
+    listPairedDevices: (): Promise<RemotePairedDeviceInfo[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.REMOTE_HOST_LIST_PAIRED_DEVICES),
+    revokePairedDevice: (deviceId: string): Promise<boolean> =>
+      ipcRenderer.invoke(IPC_CHANNELS.REMOTE_HOST_REVOKE_PAIRED_DEVICE, deviceId),
+    setMirrorV2Enabled: (enabled: boolean): Promise<RemoteHostStatus> =>
+      ipcRenderer.invoke(IPC_CHANNELS.REMOTE_HOST_SET_MIRROR_V2_ENABLED, enabled),
     onStatusChanged: (callback: (status: RemoteHostStatus) => void): (() => void) => {
       const handler = (_: unknown, status: RemoteHostStatus) => callback(status);
       ipcRenderer.on(IPC_CHANNELS.REMOTE_HOST_STATUS_CHANGED, handler);
@@ -646,6 +684,57 @@ const electronAPI = {
       const handler = (_: unknown, status: RemoteClientStatus) => callback(status);
       ipcRenderer.on(IPC_CHANNELS.REMOTE_STATUS_CHANGED, handler);
       return () => ipcRenderer.off(IPC_CHANNELS.REMOTE_STATUS_CHANGED, handler);
+    },
+  },
+
+  workspaceMirror: {
+    getSnapshot: (): Promise<WorkspaceSceneSnapshot> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_GET_SNAPSHOT),
+    getBootstrapStatus: (): Promise<{ ready: boolean }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_GET_BOOTSTRAP_STATUS),
+    dispatchIntent: (intent: WorkspaceSceneIntent): Promise<StateIntentResultFrame> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_DISPATCH_INTENT, intent),
+    requestControl: (): Promise<ControllerLease> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL),
+    releaseControl: (): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_RELEASE_CONTROL),
+    resolveEntities: (requests: WorkspaceEntityLookup[]): Promise<WorkspaceEntityResolution[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_RESOLVE_ENTITIES, requests),
+    registerEntity: (
+      kind: WorkspaceEntityKind,
+      path: string
+    ): Promise<WorkspaceEntityReservation> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_REGISTER_ENTITY, kind, path),
+    adoptEntity: (
+      kind: WorkspaceEntityKind,
+      entityId: string,
+      path: string
+    ): Promise<WorkspaceEntityAdoptionResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_ADOPT_ENTITY, kind, entityId, path),
+    stageResource: (sourcePath: string, mime?: string): Promise<WorkspaceResourceReference> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_STAGE_RESOURCE, sourcePath, mime),
+    materializeResource: (resourceId: string): Promise<string> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_MATERIALIZE_RESOURCE, resourceId),
+    fetchResource: (
+      resourceId: string
+    ): Promise<{ reference: WorkspaceResourceReference; data: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_FETCH_RESOURCE, resourceId),
+    completeLegacyImport: (): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_COMPLETE_LEGACY_IMPORT),
+    onEvent: (callback: (event: WorkspaceSceneEvent) => void): (() => void) => {
+      const handler = (_: unknown, event: WorkspaceSceneEvent) => callback(event);
+      ipcRenderer.on(IPC_CHANNELS.WORKSPACE_MIRROR_EVENT, handler);
+      return () => ipcRenderer.off(IPC_CHANNELS.WORKSPACE_MIRROR_EVENT, handler);
+    },
+    onSnapshot: (callback: (snapshot: WorkspaceSceneSnapshot) => void): (() => void) => {
+      const handler = (_: unknown, snapshot: WorkspaceSceneSnapshot) => callback(snapshot);
+      ipcRenderer.on(IPC_CHANNELS.WORKSPACE_MIRROR_SNAPSHOT, handler);
+      return () => ipcRenderer.off(IPC_CHANNELS.WORKSPACE_MIRROR_SNAPSHOT, handler);
+    },
+    onControlChanged: (callback: (lease: ControllerLease | null) => void): (() => void) => {
+      const handler = (_: unknown, lease: ControllerLease | null) => callback(lease);
+      ipcRenderer.on(IPC_CHANNELS.WORKSPACE_MIRROR_CONTROL_CHANGED, handler);
+      return () => ipcRenderer.off(IPC_CHANNELS.WORKSPACE_MIRROR_CONTROL_CHANGED, handler);
     },
   },
 

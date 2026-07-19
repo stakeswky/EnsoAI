@@ -3,7 +3,8 @@ import { TASK_COMPLETION_MARKER } from '@shared/types/agent';
 import { useCallback, useEffect, useRef } from 'react';
 import type { ResolvedAgent } from '@/components/todo/useEnabledAgents';
 import { useAgentSessionsStore } from '@/stores/agentSessions';
-import { INITIAL_AUTO_EXECUTE, useTodoStore } from '@/stores/todo';
+import { canMutateTodo, getTodoStoreKey, INITIAL_AUTO_EXECUTE, useTodoStore } from '@/stores/todo';
+import { useWorkspaceMirrorStore } from '@/stores/workspaceMirror';
 
 /**
  * Find the UI session ID matching a Claude CLI session ID.
@@ -46,7 +47,22 @@ export function useAutoExecuteTask(
   onSwitchToAgent?: () => void,
   enabledAgents?: ResolvedAgent[]
 ) {
-  const autoExecute = useTodoStore((s) => s.autoExecute[repoPath] ?? INITIAL_AUTO_EXECUTE);
+  // Recompute the key when the renderer switches between local and remote
+  // workspace projections. The Todo store key is target-scoped, so reading it
+  // only through getState() would leave this hook subscribed to the old board.
+  const todoProjectionVersion = useWorkspaceMirrorStore((state) => {
+    const snapshot = state.snapshot;
+    const repository =
+      state.projectionTarget === 'remote' && snapshot
+        ? Object.values(snapshot.catalog.repositories).find(
+            (candidate) => candidate.path === repoPath
+          )
+        : undefined;
+    return `${state.projectionTarget}:${state.syncPhase}:${state.ownsControl}:${snapshot?.hostId ?? ''}:${snapshot?.sceneId ?? ''}:${repository?.id ?? ''}`;
+  });
+  void todoProjectionVersion;
+  const todoKey = getTodoStoreKey(repoPath);
+  const autoExecute = useTodoStore((s) => s.autoExecute[todoKey] ?? INITIAL_AUTO_EXECUTE);
   const advanceQueue = useTodoStore((s) => s.advanceQueue);
   const stopAutoExecute = useTodoStore((s) => s.stopAutoExecute);
   const updateTask = useTodoStore((s) => s.updateTask);
@@ -58,12 +74,13 @@ export function useAutoExecuteTask(
   // Execute a single task
   const executeTask = useCallback(
     (taskId: string) => {
+      if (!canMutateTodo()) return;
       if (!worktreePath || !enabledAgents || enabledAgents.length === 0) {
         stopAutoExecute(repoPath);
         return;
       }
 
-      const tasks = useTodoStore.getState().tasks[repoPath] ?? [];
+      const tasks = useTodoStore.getState().tasks[todoKey] ?? [];
       const task = tasks.find((t) => t.id === taskId);
       if (!task) {
         // Task was deleted - skip to next in queue
@@ -109,6 +126,7 @@ export function useAutoExecuteTask(
     },
     [
       repoPath,
+      todoKey,
       worktreePath,
       enabledAgents,
       updateTask,
@@ -129,7 +147,7 @@ export function useAutoExecuteTask(
     (data: AgentStopNotificationData) => {
       // Read latest state to avoid stale closure
       const currentAutoExecute =
-        useTodoStore.getState().autoExecute[repoPath] ?? INITIAL_AUTO_EXECUTE;
+        useTodoStore.getState().autoExecute[todoKey] ?? INITIAL_AUTO_EXECUTE;
 
       if (!worktreePath || !currentAutoExecute.running) return;
 
@@ -155,7 +173,7 @@ export function useAutoExecuteTask(
         stopAutoExecute(repoPath);
       }
     },
-    [repoPath, worktreePath, updateTask, advanceQueue, stopAutoExecute, enabledAgents]
+    [repoPath, todoKey, worktreePath, updateTask, advanceQueue, stopAutoExecute, enabledAgents]
   );
 
   // Use ref for handler to avoid re-subscription on every callback change
