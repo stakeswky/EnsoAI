@@ -10,6 +10,7 @@ import {
   buildNavigation,
   buildTerminalPublishMutation,
   buildWorkspaceCatalog,
+  catalogRequiresSceneReplacement,
   type RepositoryBridgeState,
   stageAndMaterializeWorkspaceResources,
   unwrapWorkspaceEntityAdoptionResult,
@@ -109,6 +110,30 @@ describe('workspace mirror entity adoption', () => {
 });
 
 describe('workspace mirror atomic catalog navigation', () => {
+  it('does not replace the full scene when only runtime state changed', () => {
+    const snapshot = createEmptyWorkspaceSceneSnapshot({
+      hostId: 'host',
+      sceneId: 'scene',
+      hostEpoch: '11111111-1111-4111-8111-111111111111',
+    });
+    snapshot.terminals.sessions.terminal = {
+      id: 'terminal',
+      generation: 1,
+      repositoryId: null,
+      worktreeId: null,
+      title: 'Terminal',
+      cwd: '/',
+      groupId: null,
+      order: 0,
+      processState: 'running',
+      exitCode: null,
+    };
+
+    expect(catalogRequiresSceneReplacement(snapshot, structuredClone(snapshot.catalog))).toBe(
+      false
+    );
+  });
+
   it('uses resolved opaque IDs and preserves them when host paths change', () => {
     const previous = createEmptyWorkspaceSceneSnapshot({
       hostId: 'host',

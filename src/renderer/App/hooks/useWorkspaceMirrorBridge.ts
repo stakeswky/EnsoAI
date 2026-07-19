@@ -621,6 +621,13 @@ function buildSceneReplacement(
   };
 }
 
+export function catalogRequiresSceneReplacement(
+  snapshot: WorkspaceSceneSnapshot,
+  catalog: WorkspaceCatalogScene
+): boolean {
+  return canonicalJson(snapshot.catalog) !== canonicalJson(catalog);
+}
+
 function mutationMatches(
   snapshot: WorkspaceSceneSnapshot,
   mutation: WorkspaceSceneMutation
@@ -1007,6 +1014,7 @@ export function useWorkspaceMirrorBridge(
   const snapshot = useWorkspaceMirrorStore((state) => state.snapshot);
   const ownsControl = useWorkspaceMirrorStore((state) => state.ownsControl);
   const projectionTarget = useWorkspaceMirrorStore((state) => state.projectionTarget);
+  const bootstrapReady = useWorkspaceMirrorStore((state) => state.bootstrapReady);
   const queryClient = useQueryClient();
   const worktrees = useWorktreeStore((state) => state.worktrees);
   const editorTabs = useEditorStore((state) => state.tabs);
@@ -1316,11 +1324,15 @@ export function useWorkspaceMirrorBridge(
     repositorySettingsRevision,
     entitiesResolved,
   ]);
+  const terminalCatalogRef = useRef(catalog);
+  // Snapshot hydration recreates catalog objects, so publish terminals only on semantic changes.
+  const terminalCatalogSignature = catalog ? canonicalJson(catalog) : null;
+  terminalCatalogRef.current = catalog;
 
   useEffect(() => {
     if (!legacyStateReady || !ownsControl || !catalog) return;
     const currentSnapshot = useWorkspaceMirrorStore.getState().snapshot;
-    if (!currentSnapshot) return;
+    if (!currentSnapshot || !catalogRequiresSceneReplacement(currentSnapshot, catalog)) return;
     enqueueMutation({
       kind: 'scene.replace',
       payload: buildSceneReplacement(
@@ -1442,16 +1454,17 @@ export function useWorkspaceMirrorBridge(
   ]);
 
   useEffect(() => {
-    if (!legacyStateReady || !ownsControl || !catalog) return;
+    const terminalCatalog = terminalCatalogRef.current;
+    if (!legacyStateReady || !ownsControl || !terminalCatalog || !terminalCatalogSignature) return;
     void agentSessions;
     void terminalSessions;
     void terminalQuickSessions;
     void terminalGroupStates;
-    enqueueMutation(buildTerminalPublishMutation(catalog));
+    enqueueMutation(buildTerminalPublishMutation(terminalCatalog));
   }, [
     legacyStateReady,
     ownsControl,
-    catalog,
+    terminalCatalogSignature,
     agentSessions,
     terminalSessions,
     terminalQuickSessions,
@@ -1494,6 +1507,7 @@ export function useWorkspaceMirrorBridge(
   useEffect(() => {
     if (
       legacyImportCompletedRef.current ||
+      bootstrapReady ||
       !legacyStateReady ||
       !ownsControl ||
       projectionTarget !== 'local' ||
@@ -1548,5 +1562,5 @@ export function useWorkspaceMirrorBridge(
         console.warn('[workspace-mirror] failed to complete legacy import', error);
       }
     })();
-  }, [legacyStateReady, ownsControl, projectionTarget, catalog, enqueueMutation]);
+  }, [legacyStateReady, ownsControl, projectionTarget, bootstrapReady, catalog, enqueueMutation]);
 }
