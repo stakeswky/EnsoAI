@@ -1,14 +1,17 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { basename, posix, win32 } from 'node:path';
 import {
   type ControllerLease,
   ControllerLeaseSchema,
   canonicalizeWorkspaceScene,
+  canonicalJson,
   createEmptyWorkspaceSceneSnapshot,
   digestWorkspaceScene,
   type JsonValue,
   type StateIntentResultFrame,
   type StateReplayFrame,
   type StateResyncRequiredFrame,
+  WORKSPACE_MIRROR_SCHEMA_VERSION,
   type WorkspaceCoordFrame,
   type WorkspaceMirrorError,
   type WorkspaceMirrorErrorCode,
@@ -23,6 +26,13 @@ import {
   type WorkspaceSceneSnapshot,
   WorkspaceSceneSnapshotSchema,
 } from '@shared/types/workspaceMirror';
+import {
+  normalizeWorkspaceEntityPath,
+  type WorkspaceHostPathCasePolicy,
+  type WorkspaceHostPathPlatform,
+  workspaceEntityPathCollisionKey,
+  workspaceEntityPathLookupKey,
+} from './WorkspaceEntityRegistry';
 import {
   InMemoryWorkspaceStateRepository,
   type WorkspaceOperationRecord,
@@ -48,6 +58,20 @@ export interface WorkspaceIntentActor {
   deviceId: string;
   leaseId?: string;
 }
+
+export type WorkspaceSceneEntityUpsert =
+  | {
+      kind: 'repository';
+      entityId: string;
+      path: string;
+    }
+  | {
+      kind: 'worktree';
+      entityId: string;
+      repositoryId: string;
+      path: string;
+      branch: string | null;
+    };
 
 export interface WorkspaceIntentEffectContext {
   intent: WorkspaceSceneIntent;
@@ -124,6 +148,105 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
+function hostPathSegments(
+  path: string,
+  platform: WorkspaceHostPathPlatform
+): {
+  root: string;
+  segments: string[];
+} {
+  const pathApi = platform === 'win32' ? win32 : posix;
+  const root = pathApi.parse(path).root;
+  return {
+    root,
+    segments: path
+      .slice(root.length)
+      .split(pathApi.sep)
+      .filter((segment) => segment.length > 0),
+  };
+}
+
+function hostPathPartMatches(
+  left: string,
+  right: string,
+  casePolicy: WorkspaceHostPathCasePolicy
+): boolean {
+  return (
+    workspaceEntityPathLookupKey(left, casePolicy) ===
+    workspaceEntityPathLookupKey(right, casePolicy)
+  );
+}
+
+function rewriteHostPathRoot(
+  candidatePath: string,
+  oldRootPath: string,
+  newRootPath: string,
+  platform: WorkspaceHostPathPlatform,
+  casePolicy: WorkspaceHostPathCasePolicy
+): string {
+  const pathApi = platform === 'win32' ? win32 : posix;
+  if (!pathApi.isAbsolute(candidatePath)) return candidatePath;
+  const candidate = normalizeWorkspaceEntityPath(candidatePath, platform);
+  const oldRoot = normalizeWorkspaceEntityPath(oldRootPath, platform);
+  const newRoot = normalizeWorkspaceEntityPath(newRootPath, platform);
+  const candidateParts = hostPathSegments(candidate.path, platform);
+  const oldRootParts = hostPathSegments(oldRoot.path, platform);
+  if (
+    !hostPathPartMatches(candidateParts.root, oldRootParts.root, casePolicy) ||
+    candidateParts.segments.length < oldRootParts.segments.length ||
+    oldRootParts.segments.some(
+      (segment, index) =>
+        !hostPathPartMatches(segment, candidateParts.segments[index] ?? '', casePolicy)
+    )
+  ) {
+    return candidatePath;
+  }
+  const suffix = candidateParts.segments.slice(oldRootParts.segments.length);
+  return normalizeWorkspaceEntityPath(pathApi.join(newRoot.path, ...suffix), platform).path;
+}
+
+function rewriteWorkspaceScenePaths(
+  snapshot: WorkspaceSceneSnapshot,
+  oldRootPath: string,
+  newRootPath: string,
+  platform: WorkspaceHostPathPlatform,
+  casePolicy: WorkspaceHostPathCasePolicy
+): void {
+  const rewrite = (path: string): string =>
+    rewriteHostPathRoot(path, oldRootPath, newRootPath, platform, casePolicy);
+
+  for (const editor of Object.values(snapshot.editors)) {
+    for (const tab of editor.tabs) tab.path = rewrite(tab.path);
+    if (editor.activeFile !== null) editor.activeFile = rewrite(editor.activeFile);
+    const nextBuffers: typeof editor.buffers = {};
+    const bufferOwners = new Map<string, string>();
+    for (const [bufferKey, buffer] of Object.entries(editor.buffers)) {
+      const nextKey = rewrite(bufferKey);
+      const collisionKey = workspaceEntityPathCollisionKey(nextKey, casePolicy);
+      const owner = bufferOwners.get(collisionKey);
+      if (owner !== undefined && owner !== bufferKey) {
+        throw new WorkspaceStateConflictError(
+          `Workspace editor buffers collide after path adoption: ${owner} and ${bufferKey}`
+        );
+      }
+      bufferOwners.set(collisionKey, bufferKey);
+      nextBuffers[nextKey] = { ...buffer, path: rewrite(buffer.path) };
+    }
+    editor.buffers = nextBuffers;
+  }
+  for (const terminal of Object.values(snapshot.terminals.sessions)) {
+    terminal.cwd = rewrite(terminal.cwd);
+  }
+  for (const selections of [
+    snapshot.selections.selectedFileByWorktree,
+    snapshot.selections.selectedDiffByWorktree,
+  ]) {
+    for (const [worktreeId, path] of Object.entries(selections)) {
+      if (path !== null) selections[worktreeId] = rewrite(path);
+    }
+  }
+}
+
 function recoverRuntimeStateAfterHostRestart(
   snapshot: WorkspaceSceneSnapshot
 ): WorkspaceSceneSnapshot {
@@ -143,6 +266,10 @@ function defaultIdGenerator(): string {
 
 function eventBytes(event: WorkspaceSceneEvent): number {
   return Buffer.byteLength(JSON.stringify(event), 'utf8');
+}
+
+function digestWorkspaceRequest(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex');
 }
 
 function createError(
@@ -731,6 +858,7 @@ export class WorkspaceMirrorService {
       await this.repository.compactEventsThrough(Number.MAX_SAFE_INTEGER);
     }
     this.restoreRetainedEvents(sameEpochEvents);
+    await this.recoverUnfinishedOperations();
     this.initialized = true;
   }
 
@@ -828,6 +956,181 @@ export class WorkspaceMirrorService {
     });
   }
 
+  upsertWorkspaceEntity(entity: WorkspaceSceneEntityUpsert): Promise<void> {
+    return this.enqueue(async () => {
+      this.assertInitialized();
+      const snapshot = clone(this.scene);
+      const catalog = snapshot.catalog;
+      let rewrittenRoot: { oldPath: string; newPath: string } | null = null;
+      if (entity.kind === 'repository') {
+        if (catalog.worktrees[entity.entityId]) {
+          throw new WorkspaceStateConflictError(
+            `Workspace entity ${entity.entityId} is already a worktree`
+          );
+        }
+        const existing = catalog.repositories[entity.entityId];
+        if (existing?.path === entity.path) return;
+        const nextOrder =
+          Math.max(-1, ...Object.values(catalog.repositories).map(({ order }) => order)) + 1;
+        catalog.repositories[entity.entityId] = existing
+          ? { ...existing, path: entity.path }
+          : {
+              id: entity.entityId,
+              path: entity.path,
+              name: basename(entity.path),
+              groupId: null,
+              order: nextOrder,
+              settings: { autoInitWorktree: false, initScript: '', hidden: false },
+            };
+        if (existing) {
+          rewrittenRoot = { oldPath: existing.path, newPath: entity.path };
+          const oldNormalized = normalizeWorkspaceEntityPath(
+            existing.path,
+            this.repository.entityPathPlatform
+          );
+          const oldLookupKey = workspaceEntityPathLookupKey(
+            oldNormalized.normalizedPath,
+            this.repository.entityPathCasePolicy
+          );
+          for (const worktree of Object.values(catalog.worktrees)) {
+            if (!worktree.isMain || worktree.repositoryId !== entity.entityId) continue;
+            const worktreePath = normalizeWorkspaceEntityPath(
+              worktree.path,
+              this.repository.entityPathPlatform
+            );
+            if (
+              workspaceEntityPathLookupKey(
+                worktreePath.normalizedPath,
+                this.repository.entityPathCasePolicy
+              ) === oldLookupKey
+            ) {
+              worktree.path = entity.path;
+            }
+          }
+        }
+      } else {
+        if (catalog.repositories[entity.entityId]) {
+          throw new WorkspaceStateConflictError(
+            `Workspace entity ${entity.entityId} is already a repository`
+          );
+        }
+        if (!catalog.repositories[entity.repositoryId]) {
+          throw new WorkspaceStateConflictError(
+            `Workspace repository ${entity.repositoryId} does not exist`
+          );
+        }
+        const existing = catalog.worktrees[entity.entityId];
+        if (
+          existing?.path === entity.path &&
+          existing.repositoryId === entity.repositoryId &&
+          existing.branch === entity.branch
+        ) {
+          return;
+        }
+        const nextOrder =
+          Math.max(-1, ...Object.values(catalog.worktrees).map(({ order }) => order)) + 1;
+        catalog.worktrees[entity.entityId] = existing
+          ? {
+              ...existing,
+              repositoryId: entity.repositoryId,
+              path: entity.path,
+              branch: entity.branch,
+            }
+          : {
+              id: entity.entityId,
+              repositoryId: entity.repositoryId,
+              path: entity.path,
+              name: basename(entity.path),
+              branch: entity.branch,
+              order: nextOrder,
+              isMain: false,
+            };
+        if (existing && existing.path !== entity.path) {
+          rewrittenRoot = { oldPath: existing.path, newPath: entity.path };
+        }
+      }
+      if (rewrittenRoot) {
+        rewriteWorkspaceScenePaths(
+          snapshot,
+          rewrittenRoot.oldPath,
+          rewrittenRoot.newPath,
+          this.repository.entityPathPlatform,
+          this.repository.entityPathCasePolicy
+        );
+        await this.commitHostMutationNow(
+          WorkspaceSceneMutationSchema.parse({
+            kind: 'scene.replace',
+            payload: {
+              catalog: snapshot.catalog,
+              navigation: snapshot.navigation,
+              editors: snapshot.editors,
+              agents: snapshot.agents,
+              terminals: snapshot.terminals,
+              todos: snapshot.todos,
+              selections: snapshot.selections,
+            },
+          }),
+          'reconcile'
+        );
+        return;
+      }
+      await this.commitHostMutationNow(
+        WorkspaceSceneMutationSchema.parse({ kind: 'catalog.replace', payload: { catalog } }),
+        'reconcile'
+      );
+    });
+  }
+
+  removeWorkspaceWorktree(entityId: string): Promise<void> {
+    return this.enqueue(async () => {
+      this.assertInitialized();
+      if (!this.scene.catalog.worktrees[entityId]) return;
+      const snapshot = clone(this.scene);
+      delete snapshot.catalog.worktrees[entityId];
+      if (snapshot.navigation.activeWorktreeId === entityId) {
+        snapshot.navigation.activeWorktreeId = null;
+      }
+      delete snapshot.navigation.activePanelByWorktree[entityId];
+      delete snapshot.navigation.panelOrderByWorktree[entityId];
+      delete snapshot.editors[entityId];
+
+      for (const session of Object.values(snapshot.agents.sessions)) {
+        if (session.worktreeId === entityId) session.worktreeId = null;
+      }
+      for (const [groupId, group] of Object.entries(snapshot.agents.groups)) {
+        if (group.worktreeId === entityId) delete snapshot.agents.groups[groupId];
+      }
+      delete snapshot.agents.activeSessionByWorktree[entityId];
+
+      for (const session of Object.values(snapshot.terminals.sessions)) {
+        if (session.worktreeId === entityId) session.worktreeId = null;
+      }
+      for (const [groupId, group] of Object.entries(snapshot.terminals.groups)) {
+        if (group.worktreeId === entityId) delete snapshot.terminals.groups[groupId];
+      }
+      delete snapshot.terminals.activeSessionByWorktree[entityId];
+      delete snapshot.terminals.quickSessionByWorktree[entityId];
+      delete snapshot.selections.selectedFileByWorktree[entityId];
+      delete snapshot.selections.selectedDiffByWorktree[entityId];
+
+      await this.commitHostMutationNow(
+        WorkspaceSceneMutationSchema.parse({
+          kind: 'scene.replace',
+          payload: {
+            catalog: snapshot.catalog,
+            navigation: snapshot.navigation,
+            editors: snapshot.editors,
+            agents: snapshot.agents,
+            terminals: snapshot.terminals,
+            todos: snapshot.todos,
+            selections: snapshot.selections,
+          },
+        }),
+        'reconcile'
+      );
+    });
+  }
+
   invalidateResource(
     invalidation: Omit<WorkspaceResourceInvalidation, 'generation'>
   ): Promise<WorkspaceSceneEvent> {
@@ -870,7 +1173,11 @@ export class WorkspaceMirrorService {
     const operation: WorkspaceOperationRecord = {
       operationId,
       intentKind: mutation.kind,
+      sceneId: this.sceneId,
       clientId: source,
+      deviceId: 'host',
+      commandVersion: WORKSPACE_MIRROR_SCHEMA_VERSION,
+      requestDigest: digestWorkspaceRequest({ source, mutation }),
       state: 'committed',
       baseRevision: this.scene.revision,
       committedRevision: nextSnapshot.revision,
@@ -1188,6 +1495,12 @@ export class WorkspaceMirrorService {
       );
     }
     const intent = parsed.data;
+    const requestDigest = digestWorkspaceRequest({
+      clientSeq: intent.clientSeq,
+      baseRevision: intent.baseRevision,
+      kind: intent.kind,
+      payload: intent.payload,
+    });
 
     let existing: WorkspaceOperationRecord<WorkspaceIntentDispatchResult> | null;
     try {
@@ -1199,7 +1512,7 @@ export class WorkspaceMirrorService {
         createError('INTERNAL', 'Workspace operation ledger is unavailable', true)
       );
     }
-    if (existing) return this.resolveExistingOperation(existing, actor);
+    if (existing) return this.resolveExistingOperation(existing, actor, requestDigest);
 
     const leaseError = this.authorizeControl(actor);
     if (leaseError) return rejectedResult(intent.operationId, this.scene.revision, leaseError);
@@ -1253,8 +1566,11 @@ export class WorkspaceMirrorService {
     let operation: WorkspaceOperationRecord<WorkspaceIntentDispatchResult> = {
       operationId: intent.operationId,
       intentKind: intent.kind,
+      sceneId: this.sceneId,
       clientId: actor.clientId,
       deviceId: actor.deviceId,
+      commandVersion: WORKSPACE_MIRROR_SCHEMA_VERSION,
+      requestDigest,
       state: 'prepared',
       baseRevision: intent.baseRevision,
       createdAt: now,
@@ -1263,7 +1579,15 @@ export class WorkspaceMirrorService {
     try {
       await this.repository.saveOperation(operation);
       operation = { ...operation, state: 'executing', updatedAt: this.clock.now() };
-      await this.repository.saveOperation(operation);
+      if (
+        !(await this.repository.compareAndSwapOperation(intent.operationId, 'prepared', operation))
+      ) {
+        const raced = await this.repository.loadOperation<WorkspaceIntentDispatchResult>(
+          intent.operationId
+        );
+        if (raced) return this.resolveExistingOperation(raced, actor, requestDigest);
+        throw new Error('Workspace operation disappeared during preparation');
+      }
     } catch {
       return rejectedResult(
         intent.operationId,
@@ -1294,7 +1618,7 @@ export class WorkspaceMirrorService {
         updatedAt: this.clock.now(),
       };
       try {
-        await this.repository.saveOperation(operation);
+        await this.repository.compareAndSwapOperation(intent.operationId, 'executing', operation);
       } catch {}
       return failure;
     }
@@ -1314,7 +1638,7 @@ export class WorkspaceMirrorService {
         updatedAt: this.clock.now(),
       };
       try {
-        await this.repository.saveOperation(operation);
+        await this.repository.compareAndSwapOperation(intent.operationId, 'executing', operation);
       } catch {}
       return failure;
     }
@@ -1371,7 +1695,11 @@ export class WorkspaceMirrorService {
         updatedAt: this.clock.now(),
       };
       try {
-        await this.repository.saveOperation(reconcileRecord);
+        await this.repository.compareAndSwapOperation(
+          intent.operationId,
+          'executing',
+          reconcileRecord
+        );
       } catch {}
       return failure;
     }
@@ -1385,13 +1713,27 @@ export class WorkspaceMirrorService {
 
   private resolveExistingOperation(
     operation: WorkspaceOperationRecord<WorkspaceIntentDispatchResult>,
-    actor: WorkspaceIntentActor
+    actor: WorkspaceIntentActor,
+    requestDigest: string
   ): WorkspaceIntentDispatchResult {
-    if (operation.clientId !== actor.clientId || operation.deviceId !== actor.deviceId) {
+    if (
+      operation.sceneId !== this.sceneId ||
+      operation.clientId !== actor.clientId ||
+      operation.deviceId !== actor.deviceId ||
+      operation.commandVersion !== WORKSPACE_MIRROR_SCHEMA_VERSION ||
+      operation.requestDigest !== requestDigest
+    ) {
       return rejectedResult(
         operation.operationId,
         this.scene.revision,
-        createError('FORBIDDEN', 'Operation ID belongs to another client', false)
+        createError('CONFLICT', 'Operation ID is bound to a different request', false)
+      );
+    }
+    if (operation.resultCompactedAt !== undefined) {
+      return rejectedResult(
+        operation.operationId,
+        this.scene.revision,
+        createError('RESULT_EXPIRED', 'Workspace operation result has expired', false)
       );
     }
     if (operation.result) return clone(operation.result);
@@ -1403,17 +1745,46 @@ export class WorkspaceMirrorService {
         committedRevision: operation.committedRevision,
       };
     }
+    const persistedCode =
+      operation.error?.code === 'NOT_EXECUTED'
+        ? 'NOT_EXECUTED'
+        : operation.state === 'needs_reconcile'
+          ? 'UNKNOWN'
+          : 'UNKNOWN_OPERATION';
     return rejectedResult(
       operation.operationId,
       this.scene.revision,
       createError(
-        operation.state === 'needs_reconcile' ? 'UNKNOWN' : 'UNKNOWN_OPERATION',
-        operation.state === 'needs_reconcile'
+        persistedCode,
+        persistedCode === 'UNKNOWN'
           ? 'Workspace operation requires reconciliation'
-          : 'Workspace operation has not committed',
+          : persistedCode === 'NOT_EXECUTED'
+            ? 'Workspace operation did not begin before host restart'
+            : 'Workspace operation has not committed',
         false
       )
     );
+  }
+
+  private async recoverUnfinishedOperations(): Promise<void> {
+    const operations = await this.repository.listUnfinishedOperations(this.sceneId);
+    for (const operation of operations) {
+      if (operation.state === 'prepared') {
+        await this.repository.compareAndSwapOperation(operation.operationId, 'prepared', {
+          ...operation,
+          state: 'cancelled',
+          error: { code: 'NOT_EXECUTED', message: 'Operation did not begin before host restart' },
+          updatedAt: this.clock.now(),
+        });
+      } else if (operation.state === 'executing') {
+        await this.repository.compareAndSwapOperation(operation.operationId, 'executing', {
+          ...operation,
+          state: 'needs_reconcile',
+          error: { code: 'UNKNOWN', message: 'Operation outcome is unknown after host restart' },
+          updatedAt: this.clock.now(),
+        });
+      }
+    }
   }
 
   private authorizeControl(

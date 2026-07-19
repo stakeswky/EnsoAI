@@ -1,5 +1,6 @@
 import { realpath } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import * as os from 'node:os';
+import { dirname, join, posix, relative, resolve, win32 } from 'node:path';
 import type { WorkspaceSceneSnapshot } from '@shared/types';
 
 function isMissingPathError(error: unknown): boolean {
@@ -26,11 +27,29 @@ async function resolveFromNearestExistingAncestor(value: string): Promise<string
   }
 }
 
-function normalizeForComparison(value: string): string {
-  const resolved = resolve(value).replace(/[\\/]+$/, '');
-  return process.platform === 'win32' || process.platform === 'darwin'
-    ? resolved.toLowerCase()
-    : resolved;
+export type WorkspacePathFlavor = 'posix' | 'win32';
+
+function hostPathFlavor(): WorkspacePathFlavor {
+  return process.platform === 'win32' ? 'win32' : 'posix';
+}
+
+function normalizeForComparison(value: string, flavor: WorkspacePathFlavor): string {
+  const pathApi = flavor === 'win32' ? win32 : posix;
+  const normalized = pathApi.normalize(pathApi.resolve(value));
+  const root = pathApi.parse(normalized).root;
+  let end = normalized.length;
+  while (end > root.length && (normalized[end - 1] === '/' || normalized[end - 1] === '\\')) {
+    end -= 1;
+  }
+  return normalized.slice(0, end);
+}
+
+export function remoteRepositoryBasePath(): string {
+  return join(os.homedir(), 'ensoai', 'repos');
+}
+
+export function remoteWorktreeBasePath(): string {
+  return join(os.homedir(), 'ensoai', 'workspaces');
 }
 
 /** Return only host-owned repository/worktree roots from the canonical scene. */
@@ -46,15 +65,22 @@ export function workspaceRootPaths(snapshot: WorkspaceSceneSnapshot): string[] {
 }
 
 /** Lexically check a path without treating a sibling such as `/repo-evil` as a child. */
-export function isPathWithinRoots(candidate: string, roots: readonly string[]): boolean {
-  if (!isAbsolute(candidate)) return false;
-  const normalizedCandidate = normalizeForComparison(candidate);
+export function isPathWithinRoots(
+  candidate: string,
+  roots: readonly string[],
+  flavor: WorkspacePathFlavor = hostPathFlavor()
+): boolean {
+  const pathApi = flavor === 'win32' ? win32 : posix;
+  if (!pathApi.isAbsolute(candidate)) return false;
+  const normalizedCandidate = normalizeForComparison(candidate, flavor);
   return roots.some((root) => {
-    const normalizedRoot = normalizeForComparison(root);
-    const suffix = relative(normalizedRoot, normalizedCandidate);
-    return (
-      suffix === '' || (!suffix.startsWith(`..${sep}`) && suffix !== '..' && !isAbsolute(suffix))
-    );
+    if (!pathApi.isAbsolute(root)) return false;
+    const normalizedRoot = normalizeForComparison(root, flavor);
+    if (normalizedCandidate === normalizedRoot) return true;
+    const rootPrefix = normalizedRoot.endsWith(pathApi.sep)
+      ? normalizedRoot
+      : `${normalizedRoot}${pathApi.sep}`;
+    return normalizedCandidate.startsWith(rootPrefix);
   });
 }
 

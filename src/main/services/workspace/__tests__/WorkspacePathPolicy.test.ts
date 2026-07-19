@@ -16,6 +16,19 @@ describe('WorkspacePathPolicy', () => {
     expect(isPathWithinRoots('/workspace/repo/file.ts', ['/workspace/repo'])).toBe(true);
     expect(isPathWithinRoots('/workspace/repo-evil/file.ts', ['/workspace/repo'])).toBe(false);
     expect(isPathWithinRoots('/workspace/repo/../secret', ['/workspace/repo'])).toBe(false);
+    expect(isPathWithinRoots('/workspace/repo/file.ts', ['/workspace/Repo'])).toBe(false);
+  });
+
+  it('uses exact Windows containment so case-sensitive directories cannot alias a root', () => {
+    expect(
+      isPathWithinRoots('C:\\Workspace\\Repo\\src\\index.ts', ['C:\\Workspace\\Repo'], 'win32')
+    ).toBe(true);
+    expect(
+      isPathWithinRoots('c:\\workspace\\repo\\secret.txt', ['C:\\Workspace\\Repo'], 'win32')
+    ).toBe(false);
+    expect(
+      isPathWithinRoots('C:\\Workspace\\Repo-Evil\\secret.txt', ['C:\\Workspace\\Repo'], 'win32')
+    ).toBe(false);
   });
 
   it('rejects an existing symlink that escapes the workspace root', async () => {

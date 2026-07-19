@@ -10,7 +10,10 @@ import {
   type WorkspaceIntentActor,
   WorkspaceMirrorService,
 } from '../WorkspaceMirrorService';
-import { InMemoryWorkspaceStateRepository } from '../WorkspaceStateRepository';
+import {
+  InMemoryWorkspaceStateRepository,
+  type WorkspaceRepositoryCommit,
+} from '../WorkspaceStateRepository';
 
 const HOST_EPOCH = '11111111-1111-4111-8111-111111111111';
 const NEXT_HOST_EPOCH = '22222222-2222-4222-8222-222222222222';
@@ -72,6 +75,23 @@ function createHarness(options?: {
   };
 }
 
+class LostAcknowledgementRepository extends InMemoryWorkspaceStateRepository {
+  private failAfterNextCommit = false;
+
+  arm(): void {
+    this.failAfterNextCommit = true;
+  }
+
+  override async commit<TResult = unknown>(
+    commit: WorkspaceRepositoryCommit<TResult>
+  ): Promise<void> {
+    await super.commit(commit);
+    if (!this.failAfterNextCommit) return;
+    this.failAfterNextCommit = false;
+    throw new Error('injected lost acknowledgement after atomic commit');
+  }
+}
+
 async function gainControl(service: WorkspaceMirrorService, clientId = 'client1') {
   const actorBase = { clientId, deviceId: `device-${clientId}` };
   const result = await service.requestControl(actorBase);
@@ -115,6 +135,228 @@ describe('WorkspaceMirrorService', () => {
     });
     expect(await service.getNormalizedDigest()).toHaveLength(64);
     expect(service.getCanonicalNormalizedScene()).not.toContain('hostEpoch');
+  });
+
+  it('adopts a repository path and rewrites its complete live scene in one revision', async () => {
+    const repository = new InMemoryWorkspaceStateRepository(undefined, {
+      entityPathPlatform: 'linux',
+    });
+    const { service } = createHarness({ repository });
+    await service.initialize();
+    const empty = service.getSnapshot();
+    await service.dispatchHostMutation(
+      {
+        kind: 'scene.replace',
+        payload: {
+          catalog: catalog(),
+          navigation: {
+            ...empty.navigation,
+            selectedRepositoryId: 'repo1',
+            activeWorktreeId: 'worktree1',
+            activePanelByWorktree: { worktree1: 'file' },
+            panelOrderByWorktree: { worktree1: ['file'] },
+          },
+          editors: {
+            worktree1: {
+              tabs: [
+                {
+                  id: 'tab-source',
+                  path: '/host/repo/src/index.ts',
+                  title: 'index.ts',
+                  order: 0,
+                  encoding: 'utf-8',
+                  isUnsupported: false,
+                },
+                {
+                  id: 'tab-sibling',
+                  path: '/host/repository-sibling/keep.ts',
+                  title: 'keep.ts',
+                  order: 1,
+                  encoding: 'utf-8',
+                  isUnsupported: false,
+                },
+              ],
+              activeFile: '/host/repo/src/index.ts',
+              buffers: {
+                '/host/repo/src/index.ts': {
+                  path: '/host/repo/src/index.ts',
+                  isDirty: false,
+                  version: 1,
+                  hasExternalChange: false,
+                },
+                '/host/repository-sibling/keep.ts': {
+                  path: '/host/repository-sibling/keep.ts',
+                  isDirty: false,
+                  version: 1,
+                  hasExternalChange: false,
+                },
+              },
+            },
+          },
+          agents: empty.agents,
+          terminals: {
+            ...empty.terminals,
+            sessions: {
+              terminal1: {
+                id: 'terminal1',
+                generation: 1,
+                repositoryId: 'repo1',
+                worktreeId: 'worktree1',
+                title: 'shell',
+                cwd: '/host/repo/packages/app',
+                groupId: null,
+                order: 0,
+                processState: 'running',
+                exitCode: null,
+              },
+            },
+          },
+          todos: empty.todos,
+          selections: {
+            ...empty.selections,
+            selectedFileByWorktree: { worktree1: '/host/repo/src/index.ts' },
+            selectedDiffByWorktree: { worktree1: '/host/repo/src/changed.ts' },
+          },
+        },
+      },
+      'migration'
+    );
+    const before = service.getSnapshot();
+    const committedKinds: string[] = [];
+    service.subscribe((event) => committedKinds.push(event.kind));
+
+    await service.upsertWorkspaceEntity({
+      kind: 'repository',
+      entityId: 'repo1',
+      path: '/host/repo-renamed',
+    });
+
+    const renamed = service.getSnapshot();
+    expect(renamed.revision).toBe(before.revision + 1);
+    expect(committedKinds).toEqual(['scene.replace']);
+    expect(renamed).toMatchObject({
+      catalog: {
+        repositories: { repo1: { id: 'repo1', path: '/host/repo-renamed' } },
+        worktrees: {
+          worktree1: {
+            id: 'worktree1',
+            repositoryId: 'repo1',
+            path: '/host/repo-renamed',
+          },
+        },
+      },
+      navigation: before.navigation,
+      agents: before.agents,
+      todos: before.todos,
+      editors: {
+        worktree1: {
+          tabs: [
+            { id: 'tab-source', path: '/host/repo-renamed/src/index.ts' },
+            { id: 'tab-sibling', path: '/host/repository-sibling/keep.ts' },
+          ],
+          activeFile: '/host/repo-renamed/src/index.ts',
+          buffers: {
+            '/host/repo-renamed/src/index.ts': {
+              path: '/host/repo-renamed/src/index.ts',
+            },
+            '/host/repository-sibling/keep.ts': {
+              path: '/host/repository-sibling/keep.ts',
+            },
+          },
+        },
+      },
+      terminals: {
+        sessions: { terminal1: { cwd: '/host/repo-renamed/packages/app' } },
+      },
+      selections: {
+        selectedFileByWorktree: { worktree1: '/host/repo-renamed/src/index.ts' },
+        selectedDiffByWorktree: { worktree1: '/host/repo-renamed/src/changed.ts' },
+      },
+    });
+    await expect(repository.loadEntityRegistry('scene1')).resolves.toMatchObject({
+      entities: expect.arrayContaining([
+        expect.objectContaining({ entityId: 'repo1', currentPath: '/host/repo-renamed' }),
+        expect.objectContaining({ entityId: 'worktree1', currentPath: '/host/repo-renamed' }),
+      ]),
+      aliases: expect.arrayContaining([
+        expect.objectContaining({ entityId: 'repo1', path: '/host/repo' }),
+        expect.objectContaining({ entityId: 'worktree1', path: '/host/repo' }),
+      ]),
+      reservations: [],
+    });
+  });
+
+  it('rejects a path adoption when rewritten editor buffer keys would collide', async () => {
+    const repository = new InMemoryWorkspaceStateRepository(undefined, {
+      entityPathPlatform: 'linux',
+      entityPathCasePolicy: 'sensitive',
+    });
+    const { service } = createHarness({ repository });
+    await service.initialize();
+    const empty = service.getSnapshot();
+    await service.dispatchHostMutation(
+      {
+        kind: 'scene.replace',
+        payload: {
+          catalog: catalog(),
+          navigation: empty.navigation,
+          editors: {
+            worktree1: {
+              tabs: [
+                {
+                  id: 'old-buffer',
+                  path: '/host/repo/file.ts',
+                  title: 'file.ts',
+                  order: 0,
+                  encoding: 'utf-8',
+                  isUnsupported: false,
+                },
+                {
+                  id: 'target-buffer',
+                  path: '/host/repo-renamed/file.ts',
+                  title: 'file.ts',
+                  order: 1,
+                  encoding: 'utf-8',
+                  isUnsupported: false,
+                },
+              ],
+              activeFile: '/host/repo/file.ts',
+              buffers: {
+                '/host/repo/file.ts': {
+                  path: '/host/repo/file.ts',
+                  isDirty: false,
+                  version: 1,
+                  hasExternalChange: false,
+                },
+                '/host/repo-renamed/file.ts': {
+                  path: '/host/repo-renamed/file.ts',
+                  isDirty: false,
+                  version: 1,
+                  hasExternalChange: false,
+                },
+              },
+            },
+          },
+          agents: empty.agents,
+          terminals: empty.terminals,
+          todos: empty.todos,
+          selections: empty.selections,
+        },
+      },
+      'migration'
+    );
+    const before = service.getSnapshot();
+
+    await expect(
+      service.upsertWorkspaceEntity({
+        kind: 'repository',
+        entityId: 'repo1',
+        path: '/host/repo-renamed',
+      })
+    ).rejects.toThrow(/buffers collide/);
+
+    expect(service.getSnapshot()).toEqual(before);
+    expect(await repository.loadSnapshot()).toEqual(before);
   });
 
   it('serializes concurrent intents into monotonic revisions', async () => {
@@ -207,6 +449,76 @@ describe('WorkspaceMirrorService', () => {
     expect(effect).toHaveBeenCalledTimes(1);
     expect(events).toHaveBeenCalledTimes(1);
     expect(service.getSnapshot().revision).toBe(1);
+  });
+
+  it('recovers a canonical Todo mutation after a committed result acknowledgement is lost', async () => {
+    const repository = new LostAcknowledgementRepository();
+    const { service } = createHarness({ repository });
+    await service.initialize();
+    await service.dispatchHostMutation(
+      { kind: 'catalog.replace', payload: { catalog: catalog() } },
+      'migration'
+    );
+    const actor = await gainControl(service);
+    const intent = {
+      t: 'state.intent' as const,
+      operationId: 'todo-lost-ack',
+      clientSeq: 1,
+      baseRevision: 1,
+      kind: 'todos.replace' as const,
+      payload: {
+        todos: {
+          boardsByRepository: {
+            repo1: {
+              tasks: {
+                task1: {
+                  id: 'task1',
+                  title: 'Keep the mirrored Todo',
+                  description: '',
+                  priority: 'medium' as const,
+                  status: 'in-progress' as const,
+                  createdAt: 1,
+                  updatedAt: 1,
+                  order: 0,
+                  sessionId: null,
+                },
+              },
+              autoExecution: {
+                running: false,
+                queue: [],
+                currentTaskId: null,
+                currentSessionId: null,
+              },
+            },
+          },
+        },
+      },
+    } satisfies WorkspaceSceneIntent;
+
+    repository.arm();
+    await expect(service.dispatchIntent(intent, actor)).resolves.toMatchObject({
+      accepted: false,
+      error: { code: 'UNKNOWN' },
+    });
+    await expect(repository.loadOperation(intent.operationId)).resolves.toMatchObject({
+      state: 'committed',
+      committedRevision: 2,
+    });
+
+    const restarted = createHarness({ repository, hostEpoch: NEXT_HOST_EPOCH }).service;
+    await restarted.initialize();
+    const restartedActor = await gainControl(restarted);
+    const eventCount = (await repository.loadEvents()).length;
+    await expect(restarted.dispatchIntent(intent, restartedActor)).resolves.toMatchObject({
+      accepted: true,
+      committedRevision: 2,
+    });
+    expect(restarted.getSnapshot().todos.boardsByRepository.repo1?.tasks.task1).toMatchObject({
+      title: 'Keep the mirrored Todo',
+      status: 'in-progress',
+    });
+    expect(restarted.getSnapshot().revision).toBe(2);
+    expect(await repository.loadEvents()).toHaveLength(eventCount);
   });
 
   it('serializes control transfer behind an in-flight effect and commit', async () => {
