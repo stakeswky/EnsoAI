@@ -2,13 +2,17 @@ import { createEmptyWorkspaceSceneSnapshot } from '@shared/types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAgentSessionsStore } from '@/stores/agentSessions';
 import { loadSnapshot as loadAgentTaskSnapshot, useAgentTasksStore } from '@/stores/agentTasks';
+import { useTerminalStore } from '@/stores/terminal';
 import {
+  applySnapshotToRenderer,
   buildAgents,
   buildNavigation,
   buildWorkspaceCatalog,
+  type RepositoryBridgeState,
   stageAndMaterializeWorkspaceResources,
   unwrapWorkspaceEntityAdoptionResult,
   WorkspaceEntityAdoptionConflictError,
+  type WorktreeBridgeState,
   workspaceInvalidationQueryKey,
 } from '../useWorkspaceMirrorBridge';
 
@@ -313,5 +317,104 @@ describe('workspace mirror Agent semantic state', () => {
     });
     useAgentSessionsStore.setState({ sessions: [] });
     useAgentTasksStore.setState({ tasks: {} });
+  });
+
+  it('preserves controller Agent and Terminal state until it is published', () => {
+    const snapshot = createEmptyWorkspaceSceneSnapshot({
+      hostId: 'host',
+      sceneId: 'scene',
+      hostEpoch: '11111111-1111-4111-8111-111111111111',
+    });
+    const repositoryState: RepositoryBridgeState = {
+      repositories: [],
+      selectedRepo: null,
+      groups: [],
+      activeGroupId: 'all',
+      setRepositories: vi.fn(),
+      saveRepositories: vi.fn(),
+      setGroups: vi.fn(),
+      setSelectedRepo: vi.fn(),
+      setActiveGroupId: vi.fn(),
+    };
+    const worktreeState: WorktreeBridgeState = {
+      worktreeTabMap: {},
+      repoWorktreeMap: {},
+      worktreeOrderMap: {},
+      tabOrder: ['chat'],
+      activeTab: 'chat',
+      activeWorktree: null,
+      setWorktreeTabMap: vi.fn(),
+      setRepoWorktreeMap: vi.fn(),
+      setWorktreeOrderMap: vi.fn(),
+      setTabOrder: vi.fn(),
+      setActiveTab: vi.fn(),
+    };
+    const editorOverlay = {
+      viewStates: {},
+      pendingCursor: null,
+      currentCursorLine: null,
+      navBackStack: [],
+      navForwardStack: [],
+    };
+
+    useAgentSessionsStore.setState({
+      sessions: [
+        {
+          id: 'local-agent',
+          sessionId: 'local-agent',
+          name: 'New Session',
+          agentId: 'claude',
+          agentCommand: 'claude',
+          initialized: false,
+          activated: false,
+          repoPath: '/host/repo',
+          cwd: '/host/repo',
+          environment: 'native',
+          displayOrder: 0,
+        },
+      ],
+      activeIds: { '/host/repo::/host/repo': 'local-agent' },
+      groupStates: {},
+      runtimeStates: {},
+      enhancedInputStates: {},
+    });
+    loadAgentTaskSnapshot({
+      'local-agent': {
+        sessionId: 'local-agent',
+        sessionName: 'New Session',
+        repoPath: '/host/repo',
+        repoName: 'repo',
+        cwd: '/host/repo',
+        status: 'running',
+        description: 'Start the agent',
+        startedAt: 1,
+      },
+    });
+    useTerminalStore.setState({
+      sessions: [{ id: 'local-terminal', title: 'Terminal', cwd: '/host/repo' }],
+      activeSessionId: 'local-terminal',
+      quickTerminalSessions: { '/host/repo': 'local-terminal' },
+      worktreeGroupStates: {},
+    });
+
+    applySnapshotToRenderer(snapshot, repositoryState, worktreeState, editorOverlay, true);
+
+    expect(useAgentSessionsStore.getState().sessions.map((session) => session.id)).toEqual([
+      'local-agent',
+    ]);
+    expect(useAgentTasksStore.getState().tasks['local-agent']).toMatchObject({
+      description: 'Start the agent',
+    });
+    expect(useTerminalStore.getState()).toMatchObject({
+      sessions: [{ id: 'local-terminal' }],
+      activeSessionId: 'local-terminal',
+    });
+
+    applySnapshotToRenderer(snapshot, repositoryState, worktreeState, editorOverlay, false);
+
+    expect(useAgentSessionsStore.getState().sessions).toEqual([]);
+    expect(useAgentTasksStore.getState().tasks).toEqual({});
+    expect(useTerminalStore.getState().sessions).toEqual([]);
+    expect(useTerminalStore.getState().activeSessionId).toBeNull();
   });
 });

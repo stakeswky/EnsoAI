@@ -67,7 +67,7 @@ export interface WorktreeBridgeState {
 
 type EditorStoreState = ReturnType<typeof useEditorStore.getState>;
 
-interface EditorDeviceOverlay {
+export interface EditorDeviceOverlay {
   viewStates: Record<string, Record<string, unknown>>;
   pendingCursor: EditorStoreState['pendingCursor'];
   currentCursorLine: EditorStoreState['currentCursorLine'];
@@ -652,11 +652,12 @@ function mutationMatches(
   }
 }
 
-function applySnapshotToRenderer(
+export function applySnapshotToRenderer(
   snapshot: WorkspaceSceneSnapshot,
   repositoryState: RepositoryBridgeState,
   worktreeState: WorktreeBridgeState,
-  editorOverlay: EditorDeviceOverlay
+  editorOverlay: EditorDeviceOverlay,
+  preserveControllerRuntimeState = false
 ): void {
   projectRepositorySettings(
     Object.fromEntries(
@@ -783,175 +784,183 @@ function applySnapshotToRenderer(
       : null,
   });
 
-  const existingAgentState = useAgentSessionsStore.getState();
-  const existingSessions = new Map(
-    existingAgentState.sessions.map((session) => [session.id, session])
-  );
-  const agentSessions: Session[] = Object.values(snapshot.agents.sessions).map((session) => {
-    const existing = existingSessions.get(session.id);
-    const repositoryPath = session.repositoryId
-      ? (snapshot.catalog.repositories[session.repositoryId]?.path ?? '')
-      : '';
-    const worktreePath = session.worktreeId
-      ? (snapshot.catalog.worktrees[session.worktreeId]?.path ?? repositoryPath)
-      : repositoryPath;
-    return {
-      id: session.id,
-      sessionId: session.providerSessionId ?? existing?.sessionId ?? session.id,
-      name: session.name,
-      agentId: session.agentId,
-      agentCommand: existing?.agentCommand ?? session.agentId,
-      initialized: session.initialized,
-      activated: session.activated,
-      repoPath: repositoryPath,
-      cwd: worktreePath,
-      environment: session.environment,
-      displayOrder: session.displayOrder,
-      terminalTitle: existing?.terminalTitle,
-      userRenamed: existing?.userRenamed,
-    };
-  });
-  const agentGroupStates: Record<string, AgentGroupState> = {};
-  for (const group of Object.values(snapshot.agents.groups)) {
-    const path = snapshot.catalog.worktrees[group.worktreeId]?.path;
-    if (!path) continue;
-    const key = normalizePath(path);
-    if (!agentGroupStates[key]) {
-      agentGroupStates[key] = { groups: [], activeGroupId: null, flexPercents: [] };
-    }
-    const state = agentGroupStates[key];
-    state.groups.push({
-      id: group.id,
-      sessionIds: group.sessionIds,
-      activeSessionId: group.activeSessionId,
+  // Agent and terminal stores are optimistic while this renderer controls the scene.
+  // Replaying an older host snapshot here would erase state before its mutation is published.
+  if (!preserveControllerRuntimeState) {
+    const existingAgentState = useAgentSessionsStore.getState();
+    const existingSessions = new Map(
+      existingAgentState.sessions.map((session) => [session.id, session])
+    );
+    const agentSessions: Session[] = Object.values(snapshot.agents.sessions).map((session) => {
+      const existing = existingSessions.get(session.id);
+      const repositoryPath = session.repositoryId
+        ? (snapshot.catalog.repositories[session.repositoryId]?.path ?? '')
+        : '';
+      const worktreePath = session.worktreeId
+        ? (snapshot.catalog.worktrees[session.worktreeId]?.path ?? repositoryPath)
+        : repositoryPath;
+      return {
+        id: session.id,
+        sessionId: session.providerSessionId ?? existing?.sessionId ?? session.id,
+        name: session.name,
+        agentId: session.agentId,
+        agentCommand: existing?.agentCommand ?? session.agentId,
+        initialized: session.initialized,
+        activated: session.activated,
+        repoPath: repositoryPath,
+        cwd: worktreePath,
+        environment: session.environment,
+        displayOrder: session.displayOrder,
+        terminalTitle: existing?.terminalTitle,
+        userRenamed: existing?.userRenamed,
+      };
     });
-    state.flexPercents = state.groups.map(() => 100 / state.groups.length);
-    if (group.activeSessionId) state.activeGroupId = group.id;
-  }
-  const activeIds: Record<string, string | null> = {};
-  for (const [worktreeId, sessionId] of Object.entries(snapshot.agents.activeSessionByWorktree)) {
-    const worktree = snapshot.catalog.worktrees[worktreeId];
-    const repository = worktree ? snapshot.catalog.repositories[worktree.repositoryId] : undefined;
-    if (worktree && repository) {
-      activeIds[`${normalizePath(repository.path)}::${normalizePath(worktree.path)}`] = sessionId;
+    const agentGroupStates: Record<string, AgentGroupState> = {};
+    for (const group of Object.values(snapshot.agents.groups)) {
+      const path = snapshot.catalog.worktrees[group.worktreeId]?.path;
+      if (!path) continue;
+      const key = normalizePath(path);
+      if (!agentGroupStates[key]) {
+        agentGroupStates[key] = { groups: [], activeGroupId: null, flexPercents: [] };
+      }
+      const state = agentGroupStates[key];
+      state.groups.push({
+        id: group.id,
+        sessionIds: group.sessionIds,
+        activeSessionId: group.activeSessionId,
+      });
+      state.flexPercents = state.groups.map(() => 100 / state.groups.length);
+      if (group.activeSessionId) state.activeGroupId = group.id;
     }
-  }
-  useAgentSessionsStore.setState({
-    sessions: agentSessions,
-    activeIds,
-    groupStates: agentGroupStates,
-    runtimeStates: Object.fromEntries(
-      Object.values(snapshot.agents.sessions).map((session) => [
-        session.id,
-        {
-          outputState: session.runtimeState,
-          lastActivityAt: Date.now(),
-          wasActiveWhenOutputting: false,
-        },
-      ])
-    ),
-    enhancedInputStates: Object.fromEntries(
-      Object.values(snapshot.agents.sessions).map((session) => {
-        const existing = existingAgentState.enhancedInputStates[session.id];
-        const sameResources =
-          canonicalJson(existing?.resources ?? []) === canonicalJson(session.draft.resources);
-        return [
+    const activeIds: Record<string, string | null> = {};
+    for (const [worktreeId, sessionId] of Object.entries(snapshot.agents.activeSessionByWorktree)) {
+      const worktree = snapshot.catalog.worktrees[worktreeId];
+      const repository = worktree
+        ? snapshot.catalog.repositories[worktree.repositoryId]
+        : undefined;
+      if (worktree && repository) {
+        activeIds[`${normalizePath(repository.path)}::${normalizePath(worktree.path)}`] = sessionId;
+      }
+    }
+    useAgentSessionsStore.setState({
+      sessions: agentSessions,
+      activeIds,
+      groupStates: agentGroupStates,
+      runtimeStates: Object.fromEntries(
+        Object.values(snapshot.agents.sessions).map((session) => [
           session.id,
           {
-            open: existing?.open ?? false,
-            content: session.draft.text,
-            imagePaths: sameResources ? (existing?.imagePaths ?? []) : [],
-            resources: session.draft.resources,
+            outputState: session.runtimeState,
+            lastActivityAt: Date.now(),
+            wasActiveWhenOutputting: false,
           },
-        ];
-      })
-    ),
-  });
-  loadAgentTaskSnapshot(
-    Object.fromEntries(
-      Object.values(snapshot.agents.sessions).flatMap((session) => {
-        if (!session.task) return [];
-        const repositoryPath = session.repositoryId
-          ? (snapshot.catalog.repositories[session.repositoryId]?.path ?? '')
-          : '';
-        const worktreePath = session.worktreeId
-          ? (snapshot.catalog.worktrees[session.worktreeId]?.path ?? repositoryPath)
-          : repositoryPath;
-        return [
-          [
+        ])
+      ),
+      enhancedInputStates: Object.fromEntries(
+        Object.values(snapshot.agents.sessions).map((session) => {
+          const existing = existingAgentState.enhancedInputStates[session.id];
+          const sameResources =
+            canonicalJson(existing?.resources ?? []) === canonicalJson(session.draft.resources);
+          return [
             session.id,
             {
-              sessionId: session.id,
-              sessionName: session.name,
-              repoPath: repositoryPath,
-              repoName: basename(repositoryPath),
-              cwd: worktreePath,
-              status: session.task.status,
-              description: session.task.description,
-              startedAt: session.task.startedAt ?? 0,
-              ...(session.task.completedAt === null
-                ? {}
-                : { completedAt: session.task.completedAt }),
-              ...(session.task.waitingReason === null
-                ? {}
-                : { waitingReason: session.task.waitingReason }),
+              open: existing?.open ?? false,
+              content: session.draft.text,
+              imagePaths: sameResources ? (existing?.imagePaths ?? []) : [],
+              resources: session.draft.resources,
             },
-          ],
-        ];
-      })
-    )
-  );
-
-  useTerminalStore.setState({
-    sessions: Object.values(snapshot.terminals.sessions).map((session) => ({
-      id: session.id,
-      title: session.title,
-      cwd: session.cwd,
-    })),
-    activeSessionId:
-      (activeWorktree && snapshot.terminals.activeSessionByWorktree[activeWorktree.id]) ?? null,
-    quickTerminalSessions: Object.fromEntries(
-      Object.entries(snapshot.terminals.quickSessionByWorktree)
-        .map(([worktreeId, sessionId]) => {
-          const path = snapshot.catalog.worktrees[worktreeId]?.path;
-          return path ? [path, sessionId] : null;
+          ];
         })
-        .filter((entry): entry is [string, string] => entry !== null)
-    ),
-  });
-  const terminalGroupStates: TerminalWorktreeGroupStates = {};
-  for (const group of Object.values(snapshot.terminals.groups).sort((a, b) => a.order - b.order)) {
-    const worktree = snapshot.catalog.worktrees[group.worktreeId];
-    if (!worktree) continue;
-    const key = normalizePath(worktree.path);
-    if (!terminalGroupStates[key]) {
-      terminalGroupStates[key] = {
-        groups: [],
-        activeGroupId: null,
-        flexPercents: [],
-        originalPath: worktree.path,
-      };
-    }
-    const state = terminalGroupStates[key];
-    state.groups.push({
-      id: group.id,
-      tabs: group.sessionIds
-        .map((sessionId) => snapshot.terminals.sessions[sessionId])
-        .filter((session) => Boolean(session))
-        .map((session) => ({
-          id: session.id,
-          name: session.title,
-          title: session.title,
-          cwd: session.cwd,
-        })),
-      activeTabId: group.activeSessionId,
+      ),
     });
-    state.flexPercents = state.groups.map(() => 100 / state.groups.length);
-    if (snapshot.terminals.activeSessionByWorktree[group.worktreeId] === group.activeSessionId) {
-      state.activeGroupId = group.id;
+    loadAgentTaskSnapshot(
+      Object.fromEntries(
+        Object.values(snapshot.agents.sessions).flatMap((session) => {
+          if (!session.task) return [];
+          const repositoryPath = session.repositoryId
+            ? (snapshot.catalog.repositories[session.repositoryId]?.path ?? '')
+            : '';
+          const worktreePath = session.worktreeId
+            ? (snapshot.catalog.worktrees[session.worktreeId]?.path ?? repositoryPath)
+            : repositoryPath;
+          return [
+            [
+              session.id,
+              {
+                sessionId: session.id,
+                sessionName: session.name,
+                repoPath: repositoryPath,
+                repoName: basename(repositoryPath),
+                cwd: worktreePath,
+                status: session.task.status,
+                description: session.task.description,
+                startedAt: session.task.startedAt ?? 0,
+                ...(session.task.completedAt === null
+                  ? {}
+                  : { completedAt: session.task.completedAt }),
+                ...(session.task.waitingReason === null
+                  ? {}
+                  : { waitingReason: session.task.waitingReason }),
+              },
+            ],
+          ];
+        })
+      )
+    );
+
+    useTerminalStore.setState({
+      sessions: Object.values(snapshot.terminals.sessions).map((session) => ({
+        id: session.id,
+        title: session.title,
+        cwd: session.cwd,
+      })),
+      activeSessionId:
+        (activeWorktree && snapshot.terminals.activeSessionByWorktree[activeWorktree.id]) ?? null,
+      quickTerminalSessions: Object.fromEntries(
+        Object.entries(snapshot.terminals.quickSessionByWorktree)
+          .map(([worktreeId, sessionId]) => {
+            const path = snapshot.catalog.worktrees[worktreeId]?.path;
+            return path ? [path, sessionId] : null;
+          })
+          .filter((entry): entry is [string, string] => entry !== null)
+      ),
+    });
+    const terminalGroupStates: TerminalWorktreeGroupStates = {};
+    for (const group of Object.values(snapshot.terminals.groups).sort(
+      (a, b) => a.order - b.order
+    )) {
+      const worktree = snapshot.catalog.worktrees[group.worktreeId];
+      if (!worktree) continue;
+      const key = normalizePath(worktree.path);
+      if (!terminalGroupStates[key]) {
+        terminalGroupStates[key] = {
+          groups: [],
+          activeGroupId: null,
+          flexPercents: [],
+          originalPath: worktree.path,
+        };
+      }
+      const state = terminalGroupStates[key];
+      state.groups.push({
+        id: group.id,
+        tabs: group.sessionIds
+          .map((sessionId) => snapshot.terminals.sessions[sessionId])
+          .filter((session) => Boolean(session))
+          .map((session) => ({
+            id: session.id,
+            name: session.title,
+            title: session.title,
+            cwd: session.cwd,
+          })),
+        activeTabId: group.activeSessionId,
+      });
+      state.flexPercents = state.groups.map(() => 100 / state.groups.length);
+      if (snapshot.terminals.activeSessionByWorktree[group.worktreeId] === group.activeSessionId) {
+        state.activeGroupId = group.id;
+      }
     }
+    useTerminalStore.getState().setWorktreeGroupStates(terminalGroupStates);
   }
-  useTerminalStore.getState().setWorktreeGroupStates(terminalGroupStates);
 
   const todoTasks: Record<string, TodoTask[]> = {};
   const autoExecute: ReturnType<typeof useTodoStore.getState>['autoExecute'] = {};
@@ -1049,7 +1058,8 @@ export function useWorkspaceMirrorBridge(
       projectionTarget === 'local'
         ? 'local'
         : `remote:${remoteStatus?.host ?? 'unknown'}:${remoteStatus?.port ?? 0}`;
-    if (projectionKey !== activeProjectionKeyRef.current) {
+    const projectionChanged = projectionKey !== activeProjectionKeyRef.current;
+    if (projectionChanged) {
       editorOverlaysRef.current.set(activeProjectionKeyRef.current, captureEditorDeviceOverlay());
       activeProjectionKeyRef.current = projectionKey;
       queryClient.removeQueries({ queryKey: ['git'] });
@@ -1061,9 +1071,17 @@ export function useWorkspaceMirrorBridge(
       snapshot,
       repositoryStateRef.current,
       worktreeStateRef.current,
-      editorOverlay
+      editorOverlay,
+      ownsControl && !projectionChanged
     );
-  }, [snapshot, projectionTarget, remoteStatus?.host, remoteStatus?.port, queryClient]);
+  }, [
+    snapshot,
+    projectionTarget,
+    ownsControl,
+    remoteStatus?.host,
+    remoteStatus?.port,
+    queryClient,
+  ]);
 
   useEffect(() => {
     if (!snapshot || projectionTarget === 'transitioning') return;
