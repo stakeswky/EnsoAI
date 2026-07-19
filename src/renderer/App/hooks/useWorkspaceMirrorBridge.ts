@@ -531,6 +531,17 @@ function buildTerminals(
   return { sessions, groups, activeSessionByWorktree, quickSessionByWorktree };
 }
 
+export function buildTerminalPublishMutation(
+  catalog: WorkspaceCatalogScene
+): Extract<WorkspaceSceneMutation, { kind: 'terminals.replace' }> {
+  return {
+    kind: 'terminals.replace',
+    payload: {
+      terminals: buildTerminals(catalog, useWorkspaceMirrorStore.getState().snapshot?.terminals),
+    },
+  };
+}
+
 function buildTodos(catalog: WorkspaceCatalogScene): TodoScene {
   const state = useTodoStore.getState();
   const boardsByRepository: TodoScene['boardsByRepository'] = {};
@@ -1432,18 +1443,16 @@ export function useWorkspaceMirrorBridge(
 
   useEffect(() => {
     if (!legacyStateReady || !ownsControl || !catalog) return;
+    void agentSessions;
     void terminalSessions;
     void terminalQuickSessions;
     void terminalGroupStates;
-    enqueueMutation({
-      kind: 'terminals.replace',
-      payload: { terminals: buildTerminals(catalog, snapshot?.terminals) },
-    });
+    enqueueMutation(buildTerminalPublishMutation(catalog));
   }, [
     legacyStateReady,
     ownsControl,
     catalog,
-    snapshot,
+    agentSessions,
     terminalSessions,
     terminalQuickSessions,
     terminalGroupStates,

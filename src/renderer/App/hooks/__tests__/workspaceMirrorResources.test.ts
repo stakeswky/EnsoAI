@@ -3,10 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAgentSessionsStore } from '@/stores/agentSessions';
 import { loadSnapshot as loadAgentTaskSnapshot, useAgentTasksStore } from '@/stores/agentTasks';
 import { useTerminalStore } from '@/stores/terminal';
+import { useWorkspaceMirrorStore } from '@/stores/workspaceMirror';
 import {
   applySnapshotToRenderer,
   buildAgents,
   buildNavigation,
+  buildTerminalPublishMutation,
   buildWorkspaceCatalog,
   type RepositoryBridgeState,
   stageAndMaterializeWorkspaceResources,
@@ -416,5 +418,73 @@ describe('workspace mirror Agent semantic state', () => {
     expect(useAgentTasksStore.getState().tasks).toEqual({});
     expect(useTerminalStore.getState().sessions).toEqual([]);
     expect(useTerminalStore.getState().activeSessionId).toBeNull();
+  });
+
+  it('preserves the Host terminal lifecycle when publishing an Agent descriptor', () => {
+    const repositoryPath = '/host/repo';
+    const snapshot = createEmptyWorkspaceSceneSnapshot({
+      hostId: 'host',
+      sceneId: 'scene',
+      hostEpoch: '11111111-1111-4111-8111-111111111111',
+    });
+    const catalog = buildWorkspaceCatalog(
+      [{ id: 'repository-id', name: 'repo', path: repositoryPath }],
+      [],
+      [
+        {
+          id: 'worktree-id',
+          path: repositoryPath,
+          head: 'abc',
+          branch: 'main',
+          isMainWorktree: true,
+          isLocked: false,
+          prunable: false,
+        },
+      ],
+      repositoryPath,
+      {},
+      snapshot.catalog
+    );
+    snapshot.catalog = catalog;
+    snapshot.terminals.sessions['agent-session'] = {
+      id: 'agent-session',
+      generation: 1,
+      repositoryId: 'repository-id',
+      worktreeId: 'worktree-id',
+      title: 'Claude',
+      cwd: repositoryPath,
+      groupId: null,
+      order: 0,
+      processState: 'running',
+      exitCode: null,
+    };
+    useWorkspaceMirrorStore.setState({ snapshot });
+    useAgentSessionsStore.setState({
+      sessions: [
+        {
+          id: 'agent-session',
+          sessionId: 'agent-session',
+          name: 'Claude',
+          agentId: 'claude',
+          agentCommand: 'claude',
+          initialized: false,
+          activated: false,
+          repoPath: repositoryPath,
+          cwd: repositoryPath,
+          environment: 'native',
+          displayOrder: 0,
+        },
+      ],
+      activeIds: {},
+      groupStates: {},
+      runtimeStates: {},
+      enhancedInputStates: {},
+    });
+
+    const mutation = buildTerminalPublishMutation(catalog);
+
+    expect(mutation.payload.terminals.sessions['agent-session']?.processState).toBe('running');
+    useAgentSessionsStore.setState({ sessions: [] });
+    useWorkspaceMirrorStore.setState({ snapshot: null });
   });
 });
