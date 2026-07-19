@@ -9,6 +9,17 @@ export const WORKSPACE_MIRROR_MAX_RESOURCE_BYTES = 10 * 1024 * 1024;
 export const WORKSPACE_MIRROR_MAX_RESOURCE_CHUNK_BYTES = 512 * 1024;
 export const WORKSPACE_MIRROR_MAX_RESOURCE_BASE64_LENGTH =
   Math.ceil((WORKSPACE_MIRROR_MAX_RESOURCE_BYTES * 4) / 3) + 4;
+export const WORKSPACE_MIRROR_FLOW_BUDGETS = Object.freeze({
+  attachmentInitialCreditBytes: 1 * 1024 * 1024,
+  attachmentHardQueueBytes: 2 * 1024 * 1024,
+  maxAttachmentsPerConnection: 32,
+  connectionLowWaterBytes: 2 * 1024 * 1024,
+  connectionHighWaterBytes: 8 * 1024 * 1024,
+  connectionHardQueueBytes: 16 * 1024 * 1024,
+  hostHighWaterBytes: 64 * 1024 * 1024,
+  hostHardQueueBytes: 128 * 1024 * 1024,
+  maxStreamBytesPerFlush: 256 * 1024,
+});
 /** Opaque URI returned to remote renderers for host-owned attachments. */
 export const WORKSPACE_RESOURCE_URI_PREFIX = 'enso-resource://';
 
@@ -54,11 +65,108 @@ export const WorkspaceRevisionSchema = safeInteger;
 export const WorkspaceSequenceSchema = safeInteger;
 export const WorkspaceSha256Schema = sha256;
 
+const WorkspaceOperationStateCountsSchema = z.strictObject({
+  prepared: safeInteger,
+  executing: safeInteger,
+  committed: safeInteger,
+  failed: safeInteger,
+  needsReconcile: safeInteger,
+  cancelled: safeInteger,
+});
+
+/** Payload-free metrics contract used by later diagnostics and release gates. */
+export const WorkspaceMirrorMetricSampleSchema = z.strictObject({
+  timestamp,
+  hostEpochDigest: sha256,
+  revision: safeInteger,
+  revisionLag: safeInteger,
+  snapshotDurationMs: safeInteger,
+  replayDurationMs: safeInteger,
+  queuedBytes: safeInteger,
+  resyncReason: z
+    .enum(['epoch-changed', 'scene-changed', 'revision-gap', 'retention-floor', 'overflow'])
+    .nullable(),
+  operations: WorkspaceOperationStateCountsSchema,
+  sockets: safeInteger,
+  subscribers: safeInteger,
+  watchers: safeInteger,
+  ptys: safeInteger,
+  replayRingBytes: safeInteger,
+  resourceLeases: safeInteger,
+});
+export type WorkspaceMirrorMetricSample = z.infer<typeof WorkspaceMirrorMetricSampleSchema>;
+
 export type WorkspaceEntityId = z.infer<typeof WorkspaceEntityIdSchema>;
 export type WorkspaceHostId = z.infer<typeof WorkspaceHostIdSchema>;
 export type WorkspaceSceneId = z.infer<typeof WorkspaceSceneIdSchema>;
 export type WorkspaceHostEpoch = z.infer<typeof WorkspaceHostEpochSchema>;
 export type WorkspaceRevision = z.infer<typeof WorkspaceRevisionSchema>;
+
+export const WorkspaceEntityKindSchema = z.enum(['repository', 'worktree']);
+export type WorkspaceEntityKind = z.infer<typeof WorkspaceEntityKindSchema>;
+
+export const WorkspaceEntityLookupSchema = z.strictObject({
+  kind: WorkspaceEntityKindSchema,
+  path: boundedPath,
+});
+export type WorkspaceEntityLookup = z.infer<typeof WorkspaceEntityLookupSchema>;
+
+export const WorkspaceEntityResolutionSchema = z.discriminatedUnion('status', [
+  z.strictObject({
+    status: z.literal('resolved'),
+    sceneId: WorkspaceSceneIdSchema,
+    entityId: WorkspaceEntityIdSchema,
+    kind: WorkspaceEntityKindSchema,
+    currentPath: boundedPath,
+    normalizedPath: boundedPath,
+    aliases: z.array(boundedPath).max(MAX_COLLECTION_SIZE),
+    entityStatus: z.enum(['active', 'retired']),
+    match: z.enum(['current', 'alias', 'reservation']),
+    durable: z.boolean(),
+  }),
+  z.strictObject({
+    status: z.literal('unresolved'),
+    sceneId: WorkspaceSceneIdSchema,
+    kind: WorkspaceEntityKindSchema,
+    path: boundedPath,
+    normalizedPath: boundedPath,
+  }),
+  z.strictObject({
+    status: z.literal('ambiguous'),
+    sceneId: WorkspaceSceneIdSchema,
+    kind: WorkspaceEntityKindSchema,
+    path: boundedPath,
+    normalizedPath: boundedPath,
+    entityIds: z.array(WorkspaceEntityIdSchema).min(2).max(MAX_COLLECTION_SIZE),
+  }),
+]);
+export type WorkspaceEntityResolution = z.infer<typeof WorkspaceEntityResolutionSchema>;
+
+export const WorkspaceEntityReservationSchema = z.strictObject({
+  sceneId: WorkspaceSceneIdSchema,
+  entityId: WorkspaceEntityIdSchema,
+  kind: WorkspaceEntityKindSchema,
+  path: boundedPath,
+  normalizedPath: boundedPath,
+  disposition: z.enum(['existing', 'new', 'adopted']),
+});
+export type WorkspaceEntityReservation = z.infer<typeof WorkspaceEntityReservationSchema>;
+
+export const WorkspaceEntityAdoptionResultSchema = z.discriminatedUnion('ok', [
+  z.strictObject({
+    ok: z.literal(true),
+    reservation: WorkspaceEntityReservationSchema,
+  }),
+  z.strictObject({
+    ok: z.literal(false),
+    error: z.strictObject({
+      code: z.literal('ENTITY_ADOPTION_CONFLICT'),
+      message: z.string().min(1).max(512),
+      conflictingEntityIds: z.array(WorkspaceEntityIdSchema).max(MAX_COLLECTION_SIZE).optional(),
+    }),
+  }),
+]);
+export type WorkspaceEntityAdoptionResult = z.infer<typeof WorkspaceEntityAdoptionResultSchema>;
 
 function boundedRecord<Value extends z.ZodType>(valueSchema: Value) {
   return z.record(boundedId, valueSchema).superRefine((value, context) => {
@@ -730,6 +838,7 @@ export const WorkspaceMirrorCapabilitySchema = z.enum([
   'scene.snapshot',
   'scene.replay',
   'scene.intent',
+  'command.execute',
   'control.lease',
   'terminal.stream',
   'agent.stream',
@@ -761,6 +870,10 @@ export const WorkspaceMirrorErrorCodeSchema = z.enum([
   'LEASE_REQUIRED',
   'LEASE_EXPIRED',
   'NOT_FOUND',
+  'NOT_EXECUTED',
+  'RESULT_EXPIRED',
+  'ENTITY_ADOPTION_CONFLICT',
+  'UPGRADE_REQUIRED',
   'UNKNOWN_OPERATION',
   'UNKNOWN',
   'RATE_LIMITED',
@@ -779,6 +892,7 @@ export const WorkspaceMirrorErrorDetailsSchema = z.strictObject({
   expectedHostEpoch: WorkspaceHostEpochSchema.optional(),
   actualHostEpoch: WorkspaceHostEpochSchema.optional(),
   leaseId: boundedId.optional(),
+  conflictingEntityIds: z.array(WorkspaceEntityIdSchema).max(MAX_COLLECTION_SIZE).optional(),
   resyncReason: z
     .enum(['retention-floor', 'epoch-changed', 'revision-gap', 'checksum', 'overflow', 'bootstrap'])
     .optional(),
@@ -797,6 +911,57 @@ export type WorkspaceMirrorError = z.infer<typeof WorkspaceMirrorErrorSchema>;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+const WORKSPACE_COMMAND_UNDEFINED_KEY = '$ensoai.workspace.undefined';
+
+function encodeWorkspaceCommandValue(value: unknown): JsonValue {
+  if (value === undefined) return { [WORKSPACE_COMMAND_UNDEFINED_KEY]: true };
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(encodeWorkspaceCommandValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [key, encodeWorkspaceCommandValue(item)])
+    );
+  }
+  throw new Error('Workspace command argument is not JSON serializable');
+}
+
+function decodeWorkspaceCommandValue(value: JsonValue): unknown {
+  if (Array.isArray(value)) return value.map(decodeWorkspaceCommandValue);
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value);
+    if (
+      entries.length === 1 &&
+      entries[0]?.[0] === WORKSPACE_COMMAND_UNDEFINED_KEY &&
+      entries[0]?.[1] === true
+    ) {
+      return undefined;
+    }
+    return Object.fromEntries(
+      entries.map(([key, item]) => [key, decodeWorkspaceCommandValue(item)])
+    );
+  }
+  return value;
+}
+
+export function encodeWorkspaceCommandArgs(values: readonly unknown[]): JsonValue[] {
+  let length = values.length;
+  while (length > 0 && values[length - 1] === undefined) length -= 1;
+  return values.slice(0, length).map(encodeWorkspaceCommandValue);
+}
+
+export function decodeWorkspaceCommandArgs(values: readonly JsonValue[]): unknown[] {
+  return values.map(decodeWorkspaceCommandValue);
+}
 
 function isBoundedJsonValue(value: unknown, depth = 0, entryBudget = { value: 0 }): boolean {
   if (depth > MAX_JSON_DEPTH) {
@@ -990,6 +1155,82 @@ export const StateIntentResultFrameSchema = z.discriminatedUnion('accepted', [
 
 export type StateIntentResultFrame = z.infer<typeof StateIntentResultFrameSchema>;
 
+export const WorkspaceCommandExecuteFrameSchema = z.strictObject({
+  t: z.literal('command.execute'),
+  operationId: boundedId,
+  clientSeq: positiveSafeInteger,
+  command: boundedId,
+  commandVersion: positiveSafeInteger,
+  requestDigest: sha256,
+  args: z.array(JsonValueSchema).max(64),
+});
+
+export const WorkspaceCommandStatusFrameSchema = z.strictObject({
+  t: z.literal('command.status'),
+  requestId: boundedId,
+  operationId: boundedId,
+});
+
+const workspaceCommandResultEnvelope = {
+  t: z.literal('command.result'),
+  requestId: boundedId.optional(),
+  operationId: boundedId,
+  command: boundedId,
+  commandVersion: positiveSafeInteger,
+  requestDigest: sha256,
+};
+
+const WorkspaceCommandAvailableResultFrameSchema = z.strictObject({
+  ...workspaceCommandResultEnvelope,
+  state: z.literal('committed'),
+  result: JsonValueSchema.optional(),
+  resultDigest: sha256,
+  resultExpired: z.literal(false),
+});
+
+const WorkspaceCommandExpiredResultFrameSchema = z.strictObject({
+  ...workspaceCommandResultEnvelope,
+  state: z.literal('committed'),
+  resultDigest: sha256,
+  resultExpired: z.literal(true),
+  error: WorkspaceMirrorErrorSchema.extend({
+    code: z.literal('RESULT_EXPIRED'),
+    retryable: z.literal(false),
+  }),
+});
+
+export const WorkspaceCommandResultFrameSchema = z.union([
+  z.strictObject({
+    ...workspaceCommandResultEnvelope,
+    state: z.literal('prepared'),
+  }),
+  z.strictObject({
+    ...workspaceCommandResultEnvelope,
+    state: z.literal('executing'),
+  }),
+  WorkspaceCommandAvailableResultFrameSchema,
+  WorkspaceCommandExpiredResultFrameSchema,
+  z.strictObject({
+    ...workspaceCommandResultEnvelope,
+    state: z.literal('failed'),
+    error: WorkspaceMirrorErrorSchema,
+  }),
+  z.strictObject({
+    ...workspaceCommandResultEnvelope,
+    state: z.literal('cancelled'),
+    error: WorkspaceMirrorErrorSchema,
+  }),
+  z.strictObject({
+    ...workspaceCommandResultEnvelope,
+    state: z.literal('needs_reconcile'),
+    error: WorkspaceMirrorErrorSchema,
+  }),
+]);
+
+export type WorkspaceCommandExecuteFrame = z.infer<typeof WorkspaceCommandExecuteFrameSchema>;
+export type WorkspaceCommandStatusFrame = z.infer<typeof WorkspaceCommandStatusFrameSchema>;
+export type WorkspaceCommandResultFrame = z.infer<typeof WorkspaceCommandResultFrameSchema>;
+
 export const AuthChallengeFrameSchema = z.strictObject({
   t: z.literal('auth.challenge'),
   nonce: z.string().min(32).max(1024),
@@ -1085,6 +1326,30 @@ export const CoordinationSyncFrameSchema = z.strictObject({
   phase: WorkspaceSyncPhaseSchema,
 });
 
+export const CoordinationCommandFrameSchema = z.strictObject({
+  t: z.literal('coord.command'),
+  requestId: boundedId,
+  command: boundedId,
+  args: z.array(JsonValueSchema).max(64),
+});
+
+export const CoordinationCommandResultFrameSchema = z.discriminatedUnion('ok', [
+  z.strictObject({
+    t: z.literal('coord.commandResult'),
+    requestId: boundedId,
+    command: boundedId,
+    ok: z.literal(true),
+    result: JsonValueSchema.optional(),
+  }),
+  z.strictObject({
+    t: z.literal('coord.commandResult'),
+    requestId: boundedId,
+    command: boundedId,
+    ok: z.literal(false),
+    error: WorkspaceMirrorErrorSchema,
+  }),
+]);
+
 export const WorkspaceCoordFrameSchema = z.discriminatedUnion('t', [
   ControlRequestFrameSchema,
   ControlGrantedFrameSchema,
@@ -1092,6 +1357,8 @@ export const WorkspaceCoordFrameSchema = z.discriminatedUnion('t', [
   ControlRevokedFrameSchema,
   CoordinationPresenceFrameSchema,
   CoordinationSyncFrameSchema,
+  CoordinationCommandFrameSchema,
+  CoordinationCommandResultFrameSchema,
 ]);
 
 export type WorkspaceCoordFrame = z.infer<typeof WorkspaceCoordFrameSchema>;
@@ -1152,10 +1419,27 @@ export const StreamDetachFrameSchema = z.strictObject({
   ...streamIdentity,
 });
 
+/**
+ * Consumer credit ACK. Must be emitted only after renderer/xterm has consumed
+ * the bytes — never merely after client-main receipt of a stream.chunk.
+ */
+export const StreamAckFrameSchema = z.strictObject({
+  t: z.literal('stream.ack'),
+  ...streamIdentity,
+  consumedStreamSeq: WorkspaceSequenceSchema,
+  creditBytes: safeInteger,
+});
+
 export const StreamResetFrameSchema = z.strictObject({
   t: z.literal('stream.reset'),
   ...streamIdentity,
-  reason: z.enum(['retention-overflow', 'entity-restarted', 'sequence-gap', 'authorization']),
+  reason: z.enum([
+    'retention-overflow',
+    'entity-restarted',
+    'sequence-gap',
+    'authorization',
+    'backpressure-overflow',
+  ]),
   nextStreamSeq: WorkspaceSequenceSchema,
   sceneRevision: WorkspaceRevisionSchema,
 });
@@ -1175,6 +1459,7 @@ export const WorkspaceStreamFrameSchema = z.discriminatedUnion('t', [
   StreamInputFrameSchema,
   StreamResizeFrameSchema,
   StreamDetachFrameSchema,
+  StreamAckFrameSchema,
   StreamResetFrameSchema,
   StreamClosedFrameSchema,
 ]);
@@ -1187,8 +1472,24 @@ export type StreamChunkFrame = z.infer<typeof StreamChunkFrameSchema>;
 export type StreamInputFrame = z.infer<typeof StreamInputFrameSchema>;
 export type StreamResizeFrame = z.infer<typeof StreamResizeFrameSchema>;
 export type StreamDetachFrame = z.infer<typeof StreamDetachFrameSchema>;
+export type StreamAckFrame = z.infer<typeof StreamAckFrameSchema>;
 export type StreamResetFrame = z.infer<typeof StreamResetFrameSchema>;
 export type StreamClosedFrame = z.infer<typeof StreamClosedFrameSchema>;
+
+/** Lifecycle phase for unified disable/stop/quit coordinator (P13). */
+export const WorkspaceMirrorLifecyclePhaseSchema = z.enum(['enabled', 'quiescing', 'disabled']);
+export type WorkspaceMirrorLifecyclePhase = z.infer<typeof WorkspaceMirrorLifecyclePhaseSchema>;
+
+/** Canary rollout stages (P16). Default remains disabled until promotion. */
+export const WorkspaceMirrorCanaryStageSchema = z.enum([
+  'disabled',
+  'observer-canary',
+  'controller-canary',
+  'terminal-runtime-canary',
+  'fully-enabled',
+  'enabled',
+]);
+export type WorkspaceMirrorCanaryStage = z.infer<typeof WorkspaceMirrorCanaryStageSchema>;
 
 export const WorkspaceMirrorErrorFrameSchema = z.strictObject({
   t: z.literal('error'),
@@ -1216,6 +1517,9 @@ export const WorkspaceMirrorV2FrameSchema = z.union([
   StateResyncRequiredFrameSchema,
   WorkspaceSceneIntentSchema,
   StateIntentResultFrameSchema,
+  WorkspaceCommandExecuteFrameSchema,
+  WorkspaceCommandStatusFrameSchema,
+  WorkspaceCommandResultFrameSchema,
   WorkspaceCoordFrameSchema,
   WorkspaceStreamFrameSchema,
   WorkspaceMirrorErrorFrameSchema,

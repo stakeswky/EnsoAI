@@ -109,6 +109,7 @@ export const IPC_CHANNELS = {
   TERMINAL_DATA: 'terminal:data',
   TERMINAL_EXIT: 'terminal:exit',
   TERMINAL_STREAM_RESET: 'terminal:streamReset',
+  TERMINAL_STREAM_ACK: 'terminal:streamAck',
   TERMINAL_GET_ACTIVITY: 'terminal:getActivity',
 
   // Agent
@@ -308,6 +309,9 @@ export const IPC_CHANNELS = {
   WORKSPACE_MIRROR_DISPATCH_INTENT: 'workspaceMirror:dispatchIntent',
   WORKSPACE_MIRROR_REQUEST_CONTROL: 'workspaceMirror:requestControl',
   WORKSPACE_MIRROR_RELEASE_CONTROL: 'workspaceMirror:releaseControl',
+  WORKSPACE_MIRROR_RESOLVE_ENTITIES: 'workspaceMirror:resolveEntities',
+  WORKSPACE_MIRROR_REGISTER_ENTITY: 'workspaceMirror:registerEntity',
+  WORKSPACE_MIRROR_ADOPT_ENTITY: 'workspaceMirror:adoptEntity',
   WORKSPACE_MIRROR_STAGE_RESOURCE: 'workspaceMirror:stageResource',
   WORKSPACE_MIRROR_MATERIALIZE_RESOURCE: 'workspaceMirror:materializeResource',
   WORKSPACE_MIRROR_FETCH_RESOURCE: 'workspaceMirror:fetchResource',

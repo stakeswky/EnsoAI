@@ -2,16 +2,27 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   ControllerLeaseSchema,
+  CoordinationCommandFrameSchema,
+  CoordinationCommandResultFrameSchema,
   canonicalizeWorkspaceScene,
   canonicalJson,
   createEmptyWorkspaceSceneSnapshot,
+  decodeWorkspaceCommandArgs,
   digestWorkspaceScene,
+  encodeWorkspaceCommandArgs,
   getWorkspaceSceneDigestPayload,
   isWorkspaceResourceId,
   StateReplayFrameSchema,
   StateSnapshotChunkFrameSchema,
   StreamChunkFrameSchema,
+  WORKSPACE_MIRROR_FLOW_BUDGETS,
+  WorkspaceCommandExecuteFrameSchema,
+  WorkspaceCommandResultFrameSchema,
+  WorkspaceEntityAdoptionResultSchema,
+  WorkspaceEntityReservationSchema,
+  WorkspaceEntityResolutionSchema,
   WorkspaceMirrorErrorSchema,
+  WorkspaceMirrorMetricSampleSchema,
   WorkspaceMirrorV2FrameSchema,
   WorkspaceSceneEventSchema,
   WorkspaceSceneIntentSchema,
@@ -393,6 +404,155 @@ describe('workspace mirror intent and event schemas', () => {
     expect(WorkspaceMirrorV2FrameSchema.parse(intent)).toEqual(intent);
   });
 
+  it('round-trips durable command execute and terminal result frames', () => {
+    const execute = {
+      t: 'command.execute',
+      operationId: 'command-operation-1',
+      clientSeq: 9,
+      command: 'file:create',
+      commandVersion: 1,
+      requestDigest: CHECKSUM,
+      args: ['/srv/enso/new.ts', { content: 'hello' }],
+    } as const;
+    const result = {
+      t: 'command.result',
+      operationId: execute.operationId,
+      command: execute.command,
+      commandVersion: execute.commandVersion,
+      requestDigest: execute.requestDigest,
+      state: 'committed',
+      result: { created: true },
+      resultDigest: CHECKSUM,
+      resultExpired: false,
+    } as const;
+
+    expect(WorkspaceCommandExecuteFrameSchema.parse(execute)).toEqual(execute);
+    expect(WorkspaceMirrorV2FrameSchema.parse(execute)).toEqual(execute);
+    expect(WorkspaceCommandResultFrameSchema.parse(result)).toEqual(result);
+    expect(WorkspaceMirrorV2FrameSchema.parse(result)).toEqual(result);
+
+    const expiredResult = {
+      t: result.t,
+      operationId: result.operationId,
+      command: result.command,
+      commandVersion: result.commandVersion,
+      requestDigest: result.requestDigest,
+      state: result.state,
+      resultDigest: result.resultDigest,
+      resultExpired: true,
+      error: {
+        code: 'RESULT_EXPIRED',
+        message: 'Workspace command result is no longer available',
+        retryable: false,
+      },
+    } as const;
+    expect(WorkspaceCommandResultFrameSchema.parse(expiredResult)).toEqual(expiredResult);
+    expect(
+      WorkspaceCommandResultFrameSchema.safeParse({
+        ...expiredResult,
+        error: undefined,
+      }).success
+    ).toBe(false);
+    expect(
+      WorkspaceCommandResultFrameSchema.safeParse({
+        ...expiredResult,
+        error: { ...expiredResult.error, code: 'UNKNOWN' },
+      }).success
+    ).toBe(false);
+  });
+
+  it('round-trips bounded coordination commands outside the durable ledger', () => {
+    const request = {
+      t: 'coord.command',
+      requestId: 'watch-request-1',
+      command: 'file:watch:start',
+      args: ['/srv/enso'],
+    } as const;
+    const result = {
+      t: 'coord.commandResult',
+      requestId: request.requestId,
+      command: request.command,
+      ok: true,
+    } as const;
+
+    expect(CoordinationCommandFrameSchema.parse(request)).toEqual(request);
+    expect(CoordinationCommandResultFrameSchema.parse(result)).toEqual(result);
+    expect(WorkspaceMirrorV2FrameSchema.parse(request)).toEqual(request);
+    expect(WorkspaceMirrorV2FrameSchema.parse(result)).toEqual(result);
+  });
+
+  it('validates opaque entity resolutions and non-durable reservations', () => {
+    const resolution = {
+      status: 'resolved',
+      sceneId: 'scene-1',
+      entityId: 'legacy-opaque-id',
+      kind: 'repository',
+      currentPath: '/srv/repository',
+      normalizedPath: '/srv/repository',
+      aliases: ['/srv/old-repository'],
+      entityStatus: 'active',
+      match: 'current',
+      durable: true,
+    } as const;
+    const reservation = {
+      sceneId: 'scene-1',
+      entityId: '11111111-1111-4111-8111-111111111111',
+      kind: 'worktree',
+      path: '/srv/worktree',
+      normalizedPath: '/srv/worktree',
+      disposition: 'new',
+    } as const;
+
+    expect(WorkspaceEntityResolutionSchema.parse(resolution)).toEqual(resolution);
+    expect(WorkspaceEntityReservationSchema.parse(reservation)).toEqual(reservation);
+    expect(WorkspaceEntityAdoptionResultSchema.parse({ ok: true, reservation })).toEqual({
+      ok: true,
+      reservation,
+    });
+    expect(
+      WorkspaceEntityAdoptionResultSchema.parse({
+        ok: false,
+        error: {
+          code: 'ENTITY_ADOPTION_CONFLICT',
+          message: 'The target path belongs to another entity',
+          conflictingEntityIds: ['entity-2'],
+        },
+      })
+    ).toEqual({
+      ok: false,
+      error: {
+        code: 'ENTITY_ADOPTION_CONFLICT',
+        message: 'The target path belongs to another entity',
+        conflictingEntityIds: ['entity-2'],
+      },
+    });
+  });
+
+  it('rejects command digest collisions and untyped terminal results at the schema boundary', () => {
+    const execute = {
+      t: 'command.execute',
+      operationId: 'command-operation-1',
+      clientSeq: 9,
+      command: 'file:create',
+      commandVersion: 1,
+      requestDigest: 'not-a-digest',
+      args: [],
+    } as const;
+
+    expect(WorkspaceCommandExecuteFrameSchema.safeParse(execute).success).toBe(false);
+    expect(
+      WorkspaceCommandResultFrameSchema.safeParse({
+        ...execute,
+        t: 'command.result',
+        requestDigest: CHECKSUM,
+        state: 'committed',
+        resultDigest: CHECKSUM,
+        resultExpired: false,
+        error: { code: 'INTERNAL', message: 'must not coexist', retryable: false },
+      }).success
+    ).toBe(false);
+  });
+
   it('rejects stale-shaped editor updates before they reach a reducer', () => {
     const invalidUpdate = {
       t: 'state.intent',
@@ -448,6 +608,64 @@ describe('workspace mirror intent and event schemas', () => {
 });
 
 describe('workspace mirror transport plane schemas', () => {
+  it('freezes payload-free metrics and flow-control budgets', () => {
+    expect(Object.isFrozen(WORKSPACE_MIRROR_FLOW_BUDGETS)).toBe(true);
+    expect(WORKSPACE_MIRROR_FLOW_BUDGETS).toMatchObject({
+      attachmentInitialCreditBytes: 1_048_576,
+      connectionHardQueueBytes: 16_777_216,
+      hostHardQueueBytes: 134_217_728,
+      maxAttachmentsPerConnection: 32,
+    });
+    const metric = {
+      timestamp: 1,
+      hostEpochDigest: CHECKSUM,
+      revision: 2,
+      revisionLag: 0,
+      snapshotDurationMs: 3,
+      replayDurationMs: 4,
+      queuedBytes: 5,
+      resyncReason: null,
+      operations: {
+        prepared: 0,
+        executing: 0,
+        committed: 1,
+        failed: 0,
+        needsReconcile: 0,
+        cancelled: 0,
+      },
+      sockets: 1,
+      subscribers: 1,
+      watchers: 0,
+      ptys: 0,
+      replayRingBytes: 0,
+      resourceLeases: 0,
+    };
+    expect(WorkspaceMirrorMetricSampleSchema.parse(metric)).toEqual(metric);
+    expect(
+      WorkspaceMirrorMetricSampleSchema.safeParse({ ...metric, payload: 'canary-secret' }).success
+    ).toBe(false);
+  });
+
+  it('round-trips optional IPC arguments through the JSON command envelope', () => {
+    const encoded = encodeWorkspaceCommandArgs([
+      '/workspace/repository',
+      undefined,
+      'main',
+      true,
+      { keep: 'value', omit: undefined },
+      undefined,
+    ]);
+
+    expect(WorkspaceCommandExecuteFrameSchema.shape.args.safeParse(encoded).success).toBe(true);
+    expect(decodeWorkspaceCommandArgs(encoded)).toEqual([
+      '/workspace/repository',
+      undefined,
+      'main',
+      true,
+      { keep: 'value' },
+    ]);
+  });
+
   it('rejects malformed snapshot chunks', () => {
     const validChunk = {
       t: 'state.snapshot.chunk',

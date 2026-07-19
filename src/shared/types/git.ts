@@ -43,6 +43,8 @@ export interface BranchHeadInfo {
 }
 
 export interface GitWorktree {
+  /** Host-issued opaque identity when projected into the shared workspace scene. */
+  id?: string;
   path: string;
   head: string;
   branch: string | null;

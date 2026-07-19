@@ -40,7 +40,19 @@ export interface RemoteHelloFrame {
   host: RemoteHostInfo;
 }
 
-export type RemoteFrame = RemoteReqFrame | RemoteResFrame | RemoteEvFrame | RemoteHelloFrame;
+/** Stable transport-level failure sent before a V1 session becomes active. */
+export interface RemoteProtocolErrorFrame {
+  t: 'protocol.error';
+  code: 'UPGRADE_REQUIRED';
+  message: string;
+}
+
+export type RemoteFrame =
+  | RemoteReqFrame
+  | RemoteResFrame
+  | RemoteEvFrame
+  | RemoteHelloFrame
+  | RemoteProtocolErrorFrame;
 
 export interface RemoteHostInfo {
   platform: 'darwin' | 'win32' | 'linux';
@@ -103,7 +115,19 @@ export interface RemoteHostSettings {
   /** 'tailscale' (auto-detect) | 'all' (0.0.0.0) | 'localhost' */
   bind: 'tailscale' | 'all' | 'localhost';
   token: string;
+  /** Experimental V2 live mirror. MUST remain default false until P16 promotion. */
   mirrorV2Enabled?: boolean;
+  /**
+   * Canary stage for measured rollout. Independent of default-on.
+   * disabled | observer-canary | controller-canary | terminal-runtime-canary | fully-enabled | enabled
+   */
+  mirrorV2CanaryStage?:
+    | 'disabled'
+    | 'observer-canary'
+    | 'controller-canary'
+    | 'terminal-runtime-canary'
+    | 'fully-enabled'
+    | 'enabled';
 }
 
 /**
