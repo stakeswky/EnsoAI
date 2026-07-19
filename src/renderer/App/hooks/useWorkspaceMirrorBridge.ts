@@ -1052,6 +1052,8 @@ export function useWorkspaceMirrorBridge(
     if (projectionKey !== activeProjectionKeyRef.current) {
       editorOverlaysRef.current.set(activeProjectionKeyRef.current, captureEditorDeviceOverlay());
       activeProjectionKeyRef.current = projectionKey;
+      queryClient.removeQueries({ queryKey: ['git'] });
+      queryClient.removeQueries({ queryKey: ['worktree'] });
     }
     const editorOverlay =
       editorOverlaysRef.current.get(projectionKey) ?? emptyEditorDeviceOverlay();
@@ -1061,7 +1063,7 @@ export function useWorkspaceMirrorBridge(
       worktreeStateRef.current,
       editorOverlay
     );
-  }, [snapshot, projectionTarget, remoteStatus?.host, remoteStatus?.port]);
+  }, [snapshot, projectionTarget, remoteStatus?.host, remoteStatus?.port, queryClient]);
 
   useEffect(() => {
     if (!snapshot || projectionTarget === 'transitioning') return;

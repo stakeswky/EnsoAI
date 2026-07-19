@@ -1,5 +1,6 @@
 import {
   type ControllerLease,
+  type RemoteClientStatus,
   type StateIntentResultFrame,
   type WorkspaceSceneEvent,
   WorkspaceSceneEventSchema,
@@ -42,6 +43,21 @@ export function isLocalWorkspaceProjection(): boolean {
 export function canMutateWorkspaceProjection(): boolean {
   const { ownsControl, projectionTarget } = useWorkspaceMirrorStore.getState();
   return projectionTarget !== 'transitioning' && (projectionTarget === 'local' || ownsControl);
+}
+
+export function canQueryWorkspaceResources(
+  projectionTarget: WorkspaceProjectionTarget,
+  syncPhase: WorkspaceSyncPhase
+): boolean {
+  return projectionTarget !== 'transitioning' && syncPhase === 'live';
+}
+
+export function getWorkspaceQueryScope(
+  projectionTarget: WorkspaceProjectionTarget,
+  snapshot: WorkspaceSceneSnapshot | null
+): string {
+  if (projectionTarget === 'transitioning') return 'transitioning';
+  return `${projectionTarget}:${snapshot?.hostId ?? 'unknown'}:${snapshot?.sceneId ?? 'unknown'}`;
 }
 
 let clientSequence = 0;
@@ -145,7 +161,7 @@ export function applyWorkspaceSceneEvent(
 export const useWorkspaceMirrorStore = create<WorkspaceMirrorState>((set, get) => ({
   snapshot: null,
   syncPhase: 'disconnected',
-  projectionTarget: 'local',
+  projectionTarget: 'transitioning',
   bootstrapReady: false,
   controllerLease: null,
   ownsControl: false,
@@ -274,7 +290,7 @@ export function initWorkspaceMirrorSync(): void {
       .requestControl()
       .catch(() => undefined);
   };
-  window.electronAPI.remote.onStatusChanged((status) => {
+  const handleRemoteStatus = (status: RemoteClientStatus): void => {
     const attachedToV2 = isRemoteAttached(status) && status.mirrorProtocol === 'v2';
     useWorkspaceMirrorStore.setState({
       controllerLease: attachedToV2 ? (status.mirrorController ?? null) : null,
@@ -292,7 +308,13 @@ export function initWorkspaceMirrorSync(): void {
       return;
     }
     void refreshAndTryControl();
+  };
+  useRemoteStore.subscribe((state, previousState) => {
+    if (!state.status || state.status === previousState.status) return;
+    handleRemoteStatus(state.status);
   });
+  const initialRemoteStatus = useRemoteStore.getState().status;
+  if (initialRemoteStatus) handleRemoteStatus(initialRemoteStatus);
   setInterval(() => {
     if (useWorkspaceMirrorStore.getState().ownsControl) {
       void useWorkspaceMirrorStore
@@ -303,5 +325,4 @@ export function initWorkspaceMirrorSync(): void {
         });
     }
   }, 15_000);
-  void refreshAndTryControl();
 }

@@ -82,7 +82,7 @@ import { CreateWorktreeDialog } from '@/components/worktree/CreateWorktreeDialog
 import { useGitSync } from '@/hooks/useGitSync';
 import { useWorktreeOutputState } from '@/hooks/useOutputState';
 import { useShouldPoll } from '@/hooks/useWindowFocus';
-import { useWorktreeListMultiple } from '@/hooks/useWorktree';
+import { useWorktreeListMultiple, WORKSPACE_PATH_MISSING_ERROR } from '@/hooks/useWorktree';
 import { useI18n } from '@/i18n';
 import { heightVariants, springFast, springStandard } from '@/lib/motion';
 import { cn } from '@/lib/utils';
@@ -887,8 +887,12 @@ export function TreeSidebar({
             >
               {repoError ? (
                 <div className="py-2 px-2 text-xs text-muted-foreground flex flex-col items-center gap-1.5">
-                  <span className="text-destructive">{t('Not a Git repository')}</span>
-                  {onInitGit && isSelected && (
+                  <span className="text-destructive">
+                    {repoError === WORKSPACE_PATH_MISSING_ERROR
+                      ? t('Repository directory unavailable')
+                      : t('Not a Git repository')}
+                  </span>
+                  {onInitGit && isSelected && repoError !== WORKSPACE_PATH_MISSING_ERROR && (
                     <Button
                       onClick={async () => {
                         await onInitGit();

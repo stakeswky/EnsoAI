@@ -961,6 +961,8 @@ export default function App() {
   const handleInitGit = async () => {
     if (!selectedRepo) return;
     try {
+      const validation = await window.electronAPI.git.validateLocalPath(selectedRepo);
+      if (!validation.exists || !validation.isDirectory) return;
       await gitInitMutation.mutateAsync(selectedRepo);
       // Refresh worktrees and branches after init
       await refetch();

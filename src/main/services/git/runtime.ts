@@ -3,6 +3,7 @@ import {
   type SpawnOptionsWithoutStdio,
   spawn,
 } from 'node:child_process';
+import { existsSync, statSync } from 'node:fs';
 import { WSL_UNC_PREFIXES } from '@shared/utils/path';
 import simpleGit, { type SimpleGit, type SimpleGitOptions } from 'simple-git';
 import { getProxyEnvVars } from '../proxy/ProxyConfig';
@@ -65,6 +66,14 @@ function toWindowsUncPath(host: WslPathInfo['host'], distro: string, linuxPath: 
 
 export function isWslGitRepository(workdir: string): boolean {
   return parseWslUncPath(workdir) !== null;
+}
+
+export function isExistingDirectory(workdir: string): boolean {
+  try {
+    return existsSync(workdir) && statSync(workdir).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 export function toGitPath(workdir: string, inputPath: string): string {

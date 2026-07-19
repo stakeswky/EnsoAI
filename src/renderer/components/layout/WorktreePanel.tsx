@@ -40,6 +40,7 @@ import { CreateWorktreeDialog } from '@/components/worktree/CreateWorktreeDialog
 import { useGitSync } from '@/hooks/useGitSync';
 import { useWorktreeOutputState } from '@/hooks/useOutputState';
 import { useShouldPoll } from '@/hooks/useWindowFocus';
+import { WORKSPACE_PATH_MISSING_ERROR } from '@/hooks/useWorktree';
 import { useI18n } from '@/i18n';
 import { springFast } from '@/lib/motion';
 import { cn } from '@/lib/utils';
@@ -96,6 +97,7 @@ export function WorktreePanel({
   const [worktreeToDelete, setWorktreeToDelete] = useState<GitWorktree | null>(null);
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [forceDelete, setForceDelete] = useState(false);
+  const isWorkspacePathMissing = error === WORKSPACE_PATH_MISSING_ERROR;
 
   // Drag reorder
   const draggedIndexRef = useRef<number | null>(null);
@@ -263,9 +265,17 @@ export function WorktreePanel({
               <GitBranch className="h-4.5 w-4.5" />
             </EmptyMedia>
             <EmptyHeader>
-              <EmptyTitle className="text-base">{t('Not a Git repository')}</EmptyTitle>
+              <EmptyTitle className="text-base">
+                {isWorkspacePathMissing
+                  ? t('Repository directory unavailable')
+                  : t('Not a Git repository')}
+              </EmptyTitle>
               <EmptyDescription>
-                {t('This directory is not a Git repository. Initialize it to enable Git features.')}
+                {isWorkspacePathMissing
+                  ? t('The saved repository path no longer exists or is currently unavailable.')
+                  : t(
+                      'This directory is not a Git repository. Initialize it to enable Git features.'
+                    )}
               </EmptyDescription>
             </EmptyHeader>
             <div className="mt-2 flex gap-2">
@@ -273,7 +283,7 @@ export function WorktreePanel({
                 <RefreshCw className="mr-2 h-4 w-4" />
                 {t('Refresh')}
               </Button>
-              {onInitGit && (
+              {onInitGit && !isWorkspacePathMissing && (
                 <Button onClick={onInitGit} size="sm">
                   <GitBranch className="mr-2 h-4 w-4" />
                   {t('Initialize repository')}

@@ -3,23 +3,44 @@ import { useEffect } from 'react';
 import { normalizePath } from '@/App/storage';
 import { useRepositoryStore } from '@/stores/repository';
 import { useSettingsStore } from '@/stores/settings';
+import {
+  canQueryWorkspaceResources,
+  getWorkspaceQueryScope,
+  useWorkspaceMirrorStore,
+} from '@/stores/workspaceMirror';
 import { useShouldPoll } from './useWindowFocus';
+
+function useWorkspaceQueryContext(): { enabled: boolean; scope: string } {
+  const enabled = useWorkspaceMirrorStore((state) =>
+    canQueryWorkspaceResources(state.projectionTarget, state.syncPhase)
+  );
+  const scope = useWorkspaceMirrorStore((state) =>
+    getWorkspaceQueryScope(state.projectionTarget, state.snapshot)
+  );
+  return { enabled, scope };
+}
+
+async function workspacePathExists(workdir: string): Promise<boolean> {
+  const validation = await window.electronAPI.git.validateLocalPath(workdir);
+  return validation.exists && validation.isDirectory;
+}
 
 export function useGitStatus(workdir: string | null, isActive = true) {
   const setStatus = useRepositoryStore((s) => s.setStatus);
   const shouldPoll = useShouldPoll();
   const gitAutoFetchEnabled = useSettingsStore((s) => s.gitAutoFetchEnabled);
   const normalizedWorkdir = workdir ? normalizePath(workdir) : null;
+  const workspaceQuery = useWorkspaceQueryContext();
 
   return useQuery({
-    queryKey: ['git', 'status', normalizedWorkdir],
+    queryKey: ['git', 'status', normalizedWorkdir, workspaceQuery.scope],
     queryFn: async () => {
       if (!workdir) return null;
       const status = await window.electronAPI.git.getStatus(workdir);
       setStatus(status);
       return status;
     },
-    enabled: !!workdir,
+    enabled: !!workdir && workspaceQuery.enabled,
     refetchInterval: (query) => {
       if (!isActive || !shouldPoll || !gitAutoFetchEnabled) return false;
       return query.state.data?.truncated ? 60000 : 5000;
@@ -31,32 +52,35 @@ export function useGitStatus(workdir: string | null, isActive = true) {
 export function useGitBranches(workdir: string | null) {
   const setBranches = useRepositoryStore((s) => s.setBranches);
   const normalizedWorkdir = workdir ? normalizePath(workdir) : null;
+  const workspaceQuery = useWorkspaceQueryContext();
 
   return useQuery({
-    queryKey: ['git', 'branches', normalizedWorkdir],
+    queryKey: ['git', 'branches', normalizedWorkdir, workspaceQuery.scope],
     queryFn: async () => {
       if (!workdir) return [];
+      if (!(await workspacePathExists(workdir))) return [];
       const branches = await window.electronAPI.git.getBranches(workdir);
       setBranches(branches);
       return branches;
     },
-    enabled: !!workdir,
+    enabled: !!workdir && workspaceQuery.enabled,
   });
 }
 
 export function useGitLog(workdir: string | null, maxCount = 50) {
   const setLogs = useRepositoryStore((s) => s.setLogs);
   const normalizedWorkdir = workdir ? normalizePath(workdir) : null;
+  const workspaceQuery = useWorkspaceQueryContext();
 
   return useQuery({
-    queryKey: ['git', 'log', normalizedWorkdir, maxCount],
+    queryKey: ['git', 'log', normalizedWorkdir, maxCount, workspaceQuery.scope],
     queryFn: async () => {
       if (!workdir) return [];
       const logs = await window.electronAPI.git.getLog(workdir, maxCount);
       setLogs(logs);
       return logs;
     },
-    enabled: !!workdir,
+    enabled: !!workdir && workspaceQuery.enabled,
   });
 }
 
@@ -178,14 +202,15 @@ export function useGitPull() {
 
 export function useGitDiff(workdir: string | null, staged = false) {
   const normalizedWorkdir = workdir ? normalizePath(workdir) : null;
+  const workspaceQuery = useWorkspaceQueryContext();
 
   return useQuery({
-    queryKey: ['git', 'diff', normalizedWorkdir, staged],
+    queryKey: ['git', 'diff', normalizedWorkdir, staged, workspaceQuery.scope],
     queryFn: async () => {
       if (!workdir) return '';
       return window.electronAPI.git.getDiff(workdir, { staged });
     },
-    enabled: !!workdir,
+    enabled: !!workdir && workspaceQuery.enabled,
   });
 }
 

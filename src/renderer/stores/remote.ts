@@ -55,11 +55,25 @@ export function useEffectiveEnv(): EffectiveEnv {
 
 /** One-time listener wiring (call once at app startup) */
 export function initRemoteStatusListener(): void {
-  window.electronAPI.remote
-    .getStatus()
-    .then((status) => useRemoteStore.getState().setStatus(status))
-    .catch(console.error);
+  let receivedStatusEvent = false;
   window.electronAPI.remote.onStatusChanged((status) => {
+    receivedStatusEvent = true;
     useRemoteStore.getState().setStatus(status);
   });
+  window.electronAPI.remote
+    .getStatus()
+    .then((status) => {
+      if (!receivedStatusEvent) useRemoteStore.getState().setStatus(status);
+    })
+    .catch((error) => {
+      console.error(error);
+      if (!receivedStatusEvent) {
+        useRemoteStore.getState().setStatus({
+          state: 'disconnected',
+          host: null,
+          port: null,
+          hostInfo: null,
+        });
+      }
+    });
 }

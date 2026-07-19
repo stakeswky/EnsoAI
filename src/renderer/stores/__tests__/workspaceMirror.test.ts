@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   applyWorkspaceSceneEvent,
   canMutateWorkspaceProjection,
+  canQueryWorkspaceResources,
+  getWorkspaceQueryScope,
   useWorkspaceMirrorStore,
 } from '../workspaceMirror';
 
@@ -126,5 +128,19 @@ describe('workspace mirror renderer projection', () => {
 
     useWorkspaceMirrorStore.setState({ projectionTarget: 'transitioning', ownsControl: true });
     expect(canMutateWorkspaceProjection()).toBe(false);
+  });
+
+  it('queries workspace resources only after the active projection is live', () => {
+    expect(canQueryWorkspaceResources('transitioning', 'syncing')).toBe(false);
+    expect(canQueryWorkspaceResources('remote', 'stale')).toBe(false);
+    expect(canQueryWorkspaceResources('remote', 'live')).toBe(true);
+    expect(canQueryWorkspaceResources('local', 'live')).toBe(true);
+  });
+
+  it('isolates resource query caches by projection and scene identity', () => {
+    const snapshot = createEmptyWorkspaceSceneSnapshot(identity);
+    expect(getWorkspaceQueryScope('transitioning', snapshot)).toBe('transitioning');
+    expect(getWorkspaceQueryScope('local', snapshot)).toBe('local:host-1:scene-1');
+    expect(getWorkspaceQueryScope('remote', snapshot)).toBe('remote:host-1:scene-1');
   });
 });

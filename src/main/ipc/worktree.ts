@@ -9,6 +9,7 @@ import {
 import { ipcMain } from 'electron';
 import { updateClaudeWorkspaceFolders } from '../services/claude/ClaudeIdeBridge';
 import { gitAutoFetchService } from '../services/git/GitAutoFetchService';
+import { isExistingDirectory } from '../services/git/runtime';
 import { WorktreeService } from '../services/git/WorktreeService';
 import { stopWatchersInDirectory } from './files';
 import { ptyManager } from './terminal';
@@ -32,6 +33,10 @@ export function clearAllWorktreeServices(): void {
 
 export function registerWorktreeHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.WORKTREE_LIST, async (_, workdir: string) => {
+    if (!isExistingDirectory(workdir)) {
+      clearWorktreeService(workdir);
+      return [];
+    }
     const service = getWorktreeService(workdir);
     return service.list();
   });

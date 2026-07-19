@@ -8,17 +8,43 @@ import type {
 } from '@shared/types';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useMemo } from 'react';
+import {
+  canQueryWorkspaceResources,
+  getWorkspaceQueryScope,
+  useWorkspaceMirrorStore,
+} from '@/stores/workspaceMirror';
 import { useWorktreeStore } from '@/stores/worktree';
+
+export const WORKSPACE_PATH_MISSING_ERROR = 'WORKSPACE_PATH_MISSING';
+
+function useWorkspaceQueryContext(): { enabled: boolean; scope: string } {
+  const enabled = useWorkspaceMirrorStore((state) =>
+    canQueryWorkspaceResources(state.projectionTarget, state.syncPhase)
+  );
+  const scope = useWorkspaceMirrorStore((state) =>
+    getWorkspaceQueryScope(state.projectionTarget, state.snapshot)
+  );
+  return { enabled, scope };
+}
+
+async function assertWorkspacePathExists(workdir: string): Promise<void> {
+  const validation = await window.electronAPI.git.validateLocalPath(workdir);
+  if (!validation.exists || !validation.isDirectory) {
+    throw new Error(WORKSPACE_PATH_MISSING_ERROR);
+  }
+}
 
 export function useWorktreeList(workdir: string | null) {
   const setWorktrees = useWorktreeStore((s) => s.setWorktrees);
   const setError = useWorktreeStore((s) => s.setError);
+  const workspaceQuery = useWorkspaceQueryContext();
 
   return useQuery({
-    queryKey: ['worktree', 'list', workdir],
+    queryKey: ['worktree', 'list', workdir, workspaceQuery.scope],
     queryFn: async () => {
       if (!workdir) return [];
       try {
+        await assertWorkspacePathExists(workdir);
         const worktrees = await window.electronAPI.worktree.list(workdir);
         setWorktrees(worktrees);
         setError(null);
@@ -30,7 +56,7 @@ export function useWorktreeList(workdir: string | null) {
         return [];
       }
     },
-    enabled: !!workdir,
+    enabled: !!workdir && workspaceQuery.enabled,
     retry: false, // Don't retry on git errors
   });
 }
@@ -40,14 +66,16 @@ export function useWorktreeList(workdir: string | null) {
  * Returns a map of repo path -> worktrees array and error map.
  */
 export function useWorktreeListMultiple(repoPaths: string[]) {
+  const workspaceQuery = useWorkspaceQueryContext();
   const queries = useQueries({
     queries: repoPaths.map((repoPath) => ({
-      queryKey: ['worktree', 'listMultiple', repoPath],
+      queryKey: ['worktree', 'listMultiple', repoPath, workspaceQuery.scope],
       queryFn: async () => {
+        await assertWorkspacePathExists(repoPath);
         const worktrees = await window.electronAPI.worktree.list(repoPath);
         return { repoPath, worktrees };
       },
-      enabled: true,
+      enabled: workspaceQuery.enabled,
       retry: false,
       staleTime: 30000, // Cache for 30 seconds to avoid excessive refetching
     })),

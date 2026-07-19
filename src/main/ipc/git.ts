@@ -1,4 +1,4 @@
-import { existsSync, statSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { type FileChangeStatus, IPC_CHANNELS } from '@shared/types';
 import type { ClaudeEffort } from '@shared/types/ai';
@@ -14,6 +14,7 @@ import {
 } from '../services/ai';
 import { gitAutoFetchService } from '../services/git/GitAutoFetchService';
 import { GitService } from '../services/git/GitService';
+import { isExistingDirectory } from '../services/git/runtime';
 
 const gitServices = new Map<string, GitService>();
 
@@ -41,7 +42,7 @@ function validateWorkdir(workdir: string): string {
   // Check if workdir is authorized
   if (!authorizedWorkdirs.has(resolved)) {
     // Fallback: check if it's a valid git directory
-    if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+    if (!isExistingDirectory(resolved)) {
       throw new Error('Invalid workdir: path does not exist or is not a directory');
     }
     // Check for .git folder
@@ -77,6 +78,7 @@ export function registerGitHandlers(): void {
   );
 
   ipcMain.handle(IPC_CHANNELS.GIT_BRANCH_LIST, async (_, workdir: string) => {
+    if (!isExistingDirectory(workdir)) return [];
     const git = getGitService(workdir);
     return git.getBranches();
   });
@@ -143,7 +145,7 @@ export function registerGitHandlers(): void {
     const resolved = path.resolve(workdir);
 
     // For git init, only validate path exists and is a directory (no .git check)
-    if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+    if (!isExistingDirectory(resolved)) {
       throw new Error('Invalid workdir: path does not exist or is not a directory');
     }
 
