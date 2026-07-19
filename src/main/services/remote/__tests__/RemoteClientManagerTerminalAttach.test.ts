@@ -1,3 +1,4 @@
+import { IPC_CHANNELS } from '@shared/types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   isRemoteHostPathWithinRoot,
@@ -247,5 +248,40 @@ describe('RemoteClientManager V2 terminal attach', () => {
     });
 
     await expect(result).rejects.toThrow('terminal process is not running');
+  });
+
+  it('keeps terminal input and resize read-only while another client owns control', async () => {
+    const manager = new RemoteClientManager();
+    const send = vi.fn();
+    const connection = {
+      wc: { id: 99, isDestroyed: () => false },
+      ws: { readyState: 1, protocol: 'enso-mirror.v2', send },
+      negotiatedProtocol: 'v2',
+      mirrorSyncPhase: 'live',
+      mirrorClientId: 'observer-client',
+      mirrorDeviceId: 'observer-device',
+      mirrorLease: {
+        holderClientId: 'controller-client',
+        holderDeviceId: 'controller-device',
+        graceUntil: null,
+      },
+      mirrorStreams: new Map(),
+    } as never;
+    (
+      manager as unknown as {
+        connections: Map<number, unknown>;
+      }
+    ).connections.set(99, connection);
+
+    await expect(
+      manager.forward(99, IPC_CHANNELS.TERMINAL_WRITE, ['remote:terminal-1', 'input'])
+    ).resolves.toBeUndefined();
+    await expect(
+      manager.forward(99, IPC_CHANNELS.TERMINAL_RESIZE, [
+        'remote:terminal-1',
+        { cols: 120, rows: 40 },
+      ])
+    ).resolves.toBeUndefined();
+    expect(send).not.toHaveBeenCalled();
   });
 });

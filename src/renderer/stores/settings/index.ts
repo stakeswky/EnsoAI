@@ -46,6 +46,20 @@ export * from './defaults';
 // Re-export types and defaults for external use
 export * from './types';
 
+async function syncGitAutoFetchIfAuthorized(enabled: boolean): Promise<void> {
+  try {
+    const remoteStatus = await window.electronAPI.remote.getStatus();
+    const isReadOnlyMirror =
+      (remoteStatus.state === 'connected' || remoteStatus.state === 'reconnecting') &&
+      remoteStatus.mirrorProtocol === 'v2' &&
+      remoteStatus.mirrorOwnsControl !== true;
+    if (isReadOnlyMirror) return;
+    await window.electronAPI.git.setAutoFetchEnabled(enabled);
+  } catch (error) {
+    console.warn('[settings] Failed to sync git auto-fetch setting:', error);
+  }
+}
+
 // Apply terminal font settings to app CSS variables
 function applyTerminalFont(fontFamily: string, fontSize: number): void {
   const root = document.documentElement;
@@ -504,7 +518,7 @@ export const useSettingsStore = create<SettingsState>()(
 
       setGitAutoFetchEnabled: (gitAutoFetchEnabled) => {
         set({ gitAutoFetchEnabled });
-        window.electronAPI.git.setAutoFetchEnabled(gitAutoFetchEnabled);
+        void syncGitAutoFetchIfAuthorized(gitAutoFetchEnabled);
       },
 
       // Git Clone Setters
@@ -789,7 +803,7 @@ export const useSettingsStore = create<SettingsState>()(
 
           // Sync git auto-fetch setting to main process
           if (state.gitAutoFetchEnabled) {
-            window.electronAPI.git.setAutoFetchEnabled(true);
+            void syncGitAutoFetchIfAuthorized(true);
           }
 
           // Clean up legacy fields (async)

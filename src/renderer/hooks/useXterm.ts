@@ -10,6 +10,7 @@ import { matchesKeybinding } from '@/lib/keybinding';
 import { useNavigationStore } from '@/stores/navigation';
 import { getEffectiveEnv } from '@/stores/remote';
 import { useSettingsStore } from '@/stores/settings';
+import { canMutateWorkspaceProjection } from '@/stores/workspaceMirror';
 import '@xterm/xterm/css/xterm.css';
 
 // Regex to match file paths with optional line:column
@@ -209,14 +210,15 @@ export function useXterm({
   const isFlushPendingRef = useRef(false);
 
   const write = useCallback((data: string) => {
-    if (ptyIdRef.current) {
+    if (ptyIdRef.current && canMutateWorkspaceProjection()) {
       window.electronAPI.terminal.write(ptyIdRef.current, data);
     }
   }, []);
 
   const fitTerminal = useCallback(() => {
-    if (fitAddonRef.current && terminalRef.current && ptyIdRef.current) {
-      fitAddonRef.current.fit();
+    if (!fitAddonRef.current || !terminalRef.current) return;
+    fitAddonRef.current.fit();
+    if (ptyIdRef.current && canMutateWorkspaceProjection()) {
       window.electronAPI.terminal.resize(ptyIdRef.current, {
         cols: terminalRef.current.cols,
         rows: terminalRef.current.rows,
@@ -554,32 +556,32 @@ export function useXterm({
       if (event.type === 'keydown' && ptyIdRef.current) {
         // Cmd+Left: jump to line start (Ctrl+A)
         if (event.metaKey && !event.altKey && event.key === 'ArrowLeft') {
-          window.electronAPI.terminal.write(ptyIdRef.current, '\x01');
+          write('\x01');
           return false;
         }
         // Cmd+Right: jump to line end (Ctrl+E)
         if (event.metaKey && !event.altKey && event.key === 'ArrowRight') {
-          window.electronAPI.terminal.write(ptyIdRef.current, '\x05');
+          write('\x05');
           return false;
         }
         // Option+Left: jump word backward (ESC+b)
         if (event.altKey && !event.metaKey && event.key === 'ArrowLeft') {
-          window.electronAPI.terminal.write(ptyIdRef.current, '\x1bb');
+          write('\x1bb');
           return false;
         }
         // Option+Right: jump word forward (ESC+f)
         if (event.altKey && !event.metaKey && event.key === 'ArrowRight') {
-          window.electronAPI.terminal.write(ptyIdRef.current, '\x1bf');
+          write('\x1bf');
           return false;
         }
         // Option+Backspace: delete word backward (Ctrl+W)
         if (event.altKey && !event.metaKey && event.key === 'Backspace') {
-          window.electronAPI.terminal.write(ptyIdRef.current, '\x17');
+          write('\x17');
           return false;
         }
         // Cmd+Backspace: delete to line start (Ctrl+U)
         if (event.metaKey && !event.altKey && event.key === 'Backspace') {
-          window.electronAPI.terminal.write(ptyIdRef.current, '\x15');
+          write('\x15');
           return false;
         }
       }
@@ -607,9 +609,6 @@ export function useXterm({
     });
 
     const requestedSessionId = sessionId?.trim() || null;
-    if (requestedSessionId) {
-      ptyIdRef.current = requestedSessionId;
-    }
 
     // Register stream listeners before attach so replay cannot race the renderer.
     const cleanup = window.electronAPI.terminal.onData((event) => {
@@ -698,12 +697,16 @@ export function useXterm({
             afterStreamSeq: 0,
           });
           ptyId = attached.sessionId;
-        } catch {
+        } catch (error) {
+          if (!canMutateWorkspaceProjection()) throw error;
           ptyId = await window.electronAPI.terminal.create(createOptions);
           const attached = await window.electronAPI.terminal.attach(ptyId, { afterStreamSeq: 0 });
           ptyId = attached.sessionId;
         }
       } else {
+        if (!canMutateWorkspaceProjection()) {
+          throw new Error('Workspace control is required to create a terminal');
+        }
         ptyId = await window.electronAPI.terminal.create(createOptions);
         if (persistent) {
           const attached = await window.electronAPI.terminal.attach(ptyId, { afterStreamSeq: 0 });
@@ -727,9 +730,7 @@ export function useXterm({
 
       // Handle input
       terminal.onData((data) => {
-        if (ptyIdRef.current) {
-          window.electronAPI.terminal.write(ptyIdRef.current, data);
-        }
+        write(data);
       });
 
       // Note: Don't focus here - wait for first data to avoid cursor on blank screen
@@ -745,7 +746,7 @@ export function useXterm({
       terminal.writeln(`\x1b[31mFailed to start terminal.\x1b[0m`);
       terminal.writeln(`\x1b[33mError: ${error}\x1b[0m`);
     }
-  }, [cwd, command, shellConfig, commandKey, terminalRenderer, sessionId, persistent]);
+  }, [cwd, command, shellConfig, commandKey, terminalRenderer, sessionId, persistent, write]);
 
   useEffect(() => {
     const shouldActivate = isActive || initialCommandRef.current;
@@ -824,12 +825,14 @@ export function useXterm({
   // Handle resize
   useEffect(() => {
     const handleResize = () => {
-      if (fitAddonRef.current && terminalRef.current && ptyIdRef.current) {
+      if (fitAddonRef.current && terminalRef.current) {
         fitAddonRef.current.fit();
-        window.electronAPI.terminal.resize(ptyIdRef.current, {
-          cols: terminalRef.current.cols,
-          rows: terminalRef.current.rows,
-        });
+        if (ptyIdRef.current && canMutateWorkspaceProjection()) {
+          window.electronAPI.terminal.resize(ptyIdRef.current, {
+            cols: terminalRef.current.cols,
+            rows: terminalRef.current.rows,
+          });
+        }
         // Clear WebGL texture atlas on resize to prevent glitches
         const addon = rendererAddonRef.current;
         if (addon && 'clearTextureAtlas' in addon) {

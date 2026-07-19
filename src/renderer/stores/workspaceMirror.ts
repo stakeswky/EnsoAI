@@ -29,7 +29,7 @@ interface WorkspaceMirrorState {
   applyEvent: (event: WorkspaceSceneEvent) => void;
   refresh: () => Promise<void>;
   dispatchMutation: (mutation: WorkspaceSceneMutation) => Promise<StateIntentResultFrame>;
-  requestControl: () => Promise<ControllerLease>;
+  requestControl: (allowTransfer?: boolean) => Promise<ControllerLease>;
   releaseControl: () => Promise<void>;
 }
 
@@ -37,6 +37,11 @@ export type WorkspaceProjectionTarget = 'local' | 'remote' | 'transitioning';
 
 export function isLocalWorkspaceProjection(): boolean {
   return useWorkspaceMirrorStore.getState().projectionTarget === 'local';
+}
+
+export function canMutateWorkspaceProjection(): boolean {
+  const { ownsControl, projectionTarget } = useWorkspaceMirrorStore.getState();
+  return projectionTarget !== 'transitioning' && (projectionTarget === 'local' || ownsControl);
 }
 
 let clientSequence = 0;
@@ -220,8 +225,8 @@ export const useWorkspaceMirrorStore = create<WorkspaceMirrorState>((set, get) =
     return result;
   },
 
-  requestControl: async () => {
-    const lease = await window.electronAPI.workspaceMirror.requestControl();
+  requestControl: async (allowTransfer = false) => {
+    const lease = await window.electronAPI.workspaceMirror.requestControl(allowTransfer);
     set({ controllerLease: lease, ownsControl: true });
     return lease;
   },
@@ -270,6 +275,11 @@ export function initWorkspaceMirrorSync(): void {
       .catch(() => undefined);
   };
   window.electronAPI.remote.onStatusChanged((status) => {
+    const attachedToV2 = isRemoteAttached(status) && status.mirrorProtocol === 'v2';
+    useWorkspaceMirrorStore.setState({
+      controllerLease: attachedToV2 ? (status.mirrorController ?? null) : null,
+      ownsControl: attachedToV2 ? status.mirrorOwnsControl === true : false,
+    });
     if (status.state === 'reconnecting') {
       useWorkspaceMirrorStore.setState({ syncPhase: 'stale' });
       return;

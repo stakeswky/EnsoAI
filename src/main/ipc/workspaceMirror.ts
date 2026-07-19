@@ -124,18 +124,23 @@ export function registerWorkspaceMirrorHandlers(): void {
     }
   );
 
-  ipcMain.handle(IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL, async (event) => {
-    trackSender(event.sender);
-    let result = await service.requestControl(actorIdentity(event.sender.id));
-    if (!result.granted && event.sender.id >= REMOTE_VIRTUAL_SENDER_ID_START) {
-      await service.revokeControl('host-revoked');
-      result = await service.requestControl(actorIdentity(event.sender.id));
+  ipcMain.handle(
+    IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL,
+    async (event, options?: { allowTransfer?: boolean }) => {
+      trackSender(event.sender);
+      const actor = actorIdentity(event.sender.id);
+      const allowTransfer =
+        options?.allowTransfer === true || event.sender.id >= REMOTE_VIRTUAL_SENDER_ID_START;
+      const current = allowTransfer ? await service.getControllerLease() : null;
+      const result = allowTransfer
+        ? await service.requestControlTransfer(actor, current?.coordSeq ?? 0)
+        : await service.requestControl(actor);
+      if (!result.granted) {
+        throw new Error(result.error.message);
+      }
+      return result.lease;
     }
-    if (!result.granted) {
-      throw new Error(result.error.message);
-    }
-    return result.lease;
-  });
+  );
 
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_MIRROR_RELEASE_CONTROL, async (event) => {
     trackSender(event.sender);

@@ -4,10 +4,12 @@ import { GripVertical, Pencil, Play, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { normalizePath } from '@/App/storage';
+import { toastManager } from '@/components/ui/toast';
 import { useI18n } from '@/i18n';
 import { cn } from '@/lib/utils';
 import { useAgentSessionsStore } from '@/stores/agentSessions';
 import { useTodoStore } from '@/stores/todo';
+import { useWorkspaceMirrorStore } from '@/stores/workspaceMirror';
 import type { TaskPriority, TodoTask } from './types';
 import { type ResolvedAgent, useEnabledAgents } from './useEnabledAgents';
 
@@ -93,8 +95,41 @@ export function TaskCard({
   }, [showAgentMenu]);
 
   const handleLaunchWithAgent = useCallback(
-    (agent: ResolvedAgent) => {
+    async (agent: ResolvedAgent) => {
       if (!worktreePath) return;
+
+      const remoteStatus = await window.electronAPI.remote.getStatus().catch(() => null);
+      const mirror = useWorkspaceMirrorStore.getState();
+      const attachedToV2 =
+        remoteStatus !== null &&
+        (remoteStatus.state === 'connected' || remoteStatus.state === 'reconnecting') &&
+        remoteStatus.mirrorProtocol === 'v2';
+      if (attachedToV2 && remoteStatus.mirrorOwnsControl === true) {
+        useWorkspaceMirrorStore.setState({
+          controllerLease: remoteStatus.mirrorController ?? null,
+          ownsControl: true,
+          projectionTarget: 'remote',
+        });
+      }
+      if (!attachedToV2 && mirror.projectionTarget === 'transitioning') {
+        toastManager.add({ title: t('Workspace is still synchronizing'), type: 'info' });
+        return;
+      }
+      if (
+        (attachedToV2 && remoteStatus.mirrorOwnsControl !== true) ||
+        (!attachedToV2 && mirror.projectionTarget === 'remote' && !mirror.ownsControl)
+      ) {
+        try {
+          await mirror.requestControl(true);
+        } catch (error) {
+          toastManager.add({
+            title: t('Unable to take workspace control'),
+            description: error instanceof Error ? error.message : String(error),
+            type: 'error',
+          });
+          return;
+        }
+      }
 
       const id = crypto.randomUUID();
       // Build task context for sending to agent
@@ -147,7 +182,7 @@ export function TaskCard({
       setShowAgentMenu(false);
       onSwitchToAgent?.();
     },
-    [worktreePath, task, repoPath, onSwitchToAgent]
+    [worktreePath, task, repoPath, onSwitchToAgent, t]
   );
 
   return (

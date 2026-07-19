@@ -12,6 +12,7 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty';
+import { toastManager } from '@/components/ui/toast';
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip';
 import { useI18n } from '@/i18n';
 import { pauseFocusLock, restoreFocusIfLocked } from '@/lib/focusLock';
@@ -24,6 +25,7 @@ import { useAgentTasksStore } from '@/stores/agentTasks';
 import { useCodeReviewContinueStore } from '@/stores/codeReviewContinue';
 import { BUILTIN_AGENT_IDS, useSettingsStore } from '@/stores/settings';
 import { useTerminalStore } from '@/stores/terminal';
+import { useWorkspaceMirrorStore } from '@/stores/workspaceMirror';
 import { useWorktreeActivityStore } from '@/stores/worktreeActivity';
 import { AgentGroup } from './AgentGroup';
 import { AgentTerminal } from './AgentTerminal';
@@ -199,6 +201,64 @@ const GroupBottomBar = memo(function GroupBottomBar({
 export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }: AgentPanelProps) {
   const { t } = useI18n();
   const panelRef = useRef<HTMLDivElement>(null); // 容器引用
+  const canEditSharedWorkspace = useWorkspaceMirrorStore(
+    (state) =>
+      state.projectionTarget !== 'transitioning' &&
+      (state.projectionTarget === 'local' || state.ownsControl)
+  );
+  const [controlRequestPending, setControlRequestPending] = useState(false);
+  const controlRequestRef = useRef<Promise<boolean> | null>(null);
+  const ensureControlForMutation = useCallback(async (): Promise<boolean> => {
+    const remoteStatus = await window.electronAPI.remote.getStatus().catch(() => null);
+    const current = useWorkspaceMirrorStore.getState();
+    const attachedToV2 =
+      remoteStatus !== null &&
+      (remoteStatus.state === 'connected' || remoteStatus.state === 'reconnecting') &&
+      remoteStatus.mirrorProtocol === 'v2';
+    if (attachedToV2 && remoteStatus.mirrorOwnsControl === true) {
+      useWorkspaceMirrorStore.setState({
+        controllerLease: remoteStatus.mirrorController ?? null,
+        ownsControl: true,
+        projectionTarget: 'remote',
+      });
+      return true;
+    }
+    if (
+      !attachedToV2 &&
+      current.projectionTarget !== 'transitioning' &&
+      (current.projectionTarget === 'local' || current.ownsControl)
+    ) {
+      return true;
+    }
+    if (!attachedToV2 && current.projectionTarget === 'transitioning') {
+      toastManager.add({
+        title: t('Workspace is still synchronizing'),
+        description: t('Wait for the remote workspace to finish synchronizing and try again.'),
+        type: 'info',
+      });
+      return false;
+    }
+    if (controlRequestRef.current) return controlRequestRef.current;
+
+    setControlRequestPending(true);
+    const request = current
+      .requestControl(true)
+      .then(() => true)
+      .catch((error) => {
+        toastManager.add({
+          title: t('Unable to take workspace control'),
+          description: error instanceof Error ? error.message : String(error),
+          type: 'error',
+        });
+        return false;
+      })
+      .finally(() => {
+        controlRequestRef.current = null;
+        setControlRequestPending(false);
+      });
+    controlRequestRef.current = request;
+    return request;
+  }, [t]);
   const {
     agentSettings,
     agentDetectionStatus,
@@ -355,8 +415,9 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
     });
   }, []);
 
-  const handleToggleQuickTerminal = useCallback(() => {
+  const handleToggleQuickTerminal = useCallback(async () => {
     const nextOpen = !quickTerminalOpen;
+    if (nextOpen && !(await ensureControlForMutation())) return;
     if (nextOpen) {
       pauseQuickTerminalFocusLock();
     }
@@ -370,10 +431,12 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
     setQuickTerminalOpen,
     pauseQuickTerminalFocusLock,
     releaseQuickTerminalFocusLock,
+    ensureControlForMutation,
   ]);
 
   const handleQuickTerminalOpenChange = useCallback(
-    (open: boolean) => {
+    async (open: boolean) => {
+      if (open && !(await ensureControlForMutation())) return;
       if (open) {
         pauseQuickTerminalFocusLock();
       }
@@ -383,7 +446,12 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
         releaseQuickTerminalFocusLock(true);
       }
     },
-    [setQuickTerminalOpen, pauseQuickTerminalFocusLock, releaseQuickTerminalFocusLock]
+    [
+      setQuickTerminalOpen,
+      pauseQuickTerminalFocusLock,
+      releaseQuickTerminalFocusLock,
+      ensureControlForMutation,
+    ]
   );
 
   const handleCloseQuickTerminal = useCallback(() => {
@@ -631,7 +699,8 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
 
   // Handle new session in active group
   const handleNewSession = useCallback(
-    (targetGroupId?: string) => {
+    async (targetGroupId?: string) => {
+      if (!(await ensureControlForMutation())) return;
       const newSession = createSession(repoPath, cwd, defaultAgentId, customAgents, agentSettings);
       addSession(newSession);
 
@@ -688,6 +757,7 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
       claudeCodeIntegration.enhancedInputEnabled,
       claudeCodeIntegration.enhancedInputAutoPopup,
       setEnhancedInputOpen,
+      ensureControlForMutation,
     ]
   );
 
@@ -1004,7 +1074,8 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
   );
 
   const handleNewSessionWithAgent = useCallback(
-    (agentId: string, agentCommand: string, targetGroupId?: string) => {
+    async (agentId: string, agentCommand: string, targetGroupId?: string) => {
+      if (!(await ensureControlForMutation())) return;
       // Handle Hapi and Happy agent IDs
       const isHapi = agentId.endsWith('-hapi');
       const isHappy = agentId.endsWith('-happy');
@@ -1090,6 +1161,7 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
       claudeCodeIntegration.enhancedInputEnabled,
       claudeCodeIntegration.enhancedInputAutoPopup,
       setEnhancedInputOpen,
+      ensureControlForMutation,
     ]
   );
 
@@ -1291,6 +1363,7 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
   useEffect(() => {
     if (
       shouldAutoCreateSession &&
+      canEditSharedWorkspace &&
       isActive &&
       cwd &&
       groups.length === 0 &&
@@ -1300,6 +1373,7 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
     }
   }, [
     shouldAutoCreateSession,
+    canEditSharedWorkspace,
     isActive,
     cwd,
     groups.length,
@@ -1536,13 +1610,14 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
               <Button
                 variant="outline"
                 size="sm"
+                disabled={controlRequestPending}
                 onClick={() => {
                   handleNewSession();
                   setShowAgentMenu(false);
                 }}
               >
                 <Plus className="mr-2 h-4 w-4" />
-                {t('New Session')}
+                {canEditSharedWorkspace ? t('New Session') : t('Take Control & New Session')}
               </Button>
               {showAgentMenu && enabledAgents.length > 0 && (
                 <div className="absolute left-0 top-full pt-1 z-50 min-w-40 text-left">

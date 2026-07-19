@@ -276,6 +276,7 @@ export const zhTranslations: Record<string, string> = {
   'Group Name': '分组名称',
   'New Folder': '新建文件夹',
   'New Session': '新建 Session',
+  'Take Control & New Session': '取得控制权并新建 Session',
   'New Tab': '新建标签',
   'New Terminal': '新建终端',
   'New Worktree': '新建 Worktree',
@@ -313,6 +314,10 @@ export const zhTranslations: Record<string, string> = {
   'No terminals open': '暂无终端',
   'Create a terminal to start working': '创建终端以开始工作',
   'Create a session to start using AI Agent': '创建 Session 以开始使用 AI Agent',
+  'Workspace is still synchronizing': '工作区仍在同步',
+  'Wait for the remote workspace to finish synchronizing and try again.':
+    '请等待远程工作区完成同步后重试。',
+  'Unable to take workspace control': '无法取得工作区控制权',
   'File Explorer': '文件浏览器',
   'Select a Worktree': '选择 Worktree',
   'Select a Worktree to browse files': '选择 Worktree 以浏览文件',

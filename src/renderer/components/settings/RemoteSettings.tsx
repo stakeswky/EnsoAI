@@ -163,7 +163,7 @@ export function RemoteSettings() {
       if (clientStatus?.mirrorOwnsControl) {
         await releaseControl();
       } else {
-        await requestControl();
+        await requestControl(true);
       }
       setClientStatus(await window.electronAPI.remote.getStatus());
     } catch (error) {

@@ -802,17 +802,21 @@ describe('WorkspaceMirrorService', () => {
     const { service, advance } = createHarness();
     await service.initialize();
     const beforeDigest = await service.getNormalizedDigest();
-    const first = await gainControl(service, 'client1');
+    await gainControl(service, 'client1');
     const denied = await service.requestControl({
       clientId: 'client2',
       deviceId: 'device-client2',
     });
     expect(denied).toMatchObject({ granted: false, error: { code: 'LEASE_REQUIRED' } });
 
-    const transferred = await service.transferControl(first, {
-      clientId: 'client2',
-      deviceId: 'device-client2',
-    });
+    const currentLease = await service.getControllerLease();
+    const transferred = await service.requestControlTransfer(
+      {
+        clientId: 'client2',
+        deviceId: 'device-client2',
+      },
+      currentLease?.coordSeq ?? 0
+    );
     expect(transferred).toMatchObject({ granted: true, lease: { holderClientId: 'client2' } });
     if (!transferred.granted) throw new Error('Expected transferred lease');
     const second = {

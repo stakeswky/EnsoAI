@@ -1,6 +1,10 @@
 import { createEmptyWorkspaceSceneSnapshot } from '@shared/types';
 import { describe, expect, it, vi } from 'vitest';
-import { applyWorkspaceSceneEvent, useWorkspaceMirrorStore } from '../workspaceMirror';
+import {
+  applyWorkspaceSceneEvent,
+  canMutateWorkspaceProjection,
+  useWorkspaceMirrorStore,
+} from '../workspaceMirror';
 
 const identity = {
   hostId: 'host-1',
@@ -97,7 +101,8 @@ describe('workspace mirror renderer projection', () => {
     });
     useWorkspaceMirrorStore.setState({ controllerLease: null, ownsControl: false });
 
-    await expect(useWorkspaceMirrorStore.getState().requestControl()).resolves.toEqual(lease);
+    await expect(useWorkspaceMirrorStore.getState().requestControl(true)).resolves.toEqual(lease);
+    expect(requestControl).toHaveBeenCalledWith(true);
     expect(useWorkspaceMirrorStore.getState()).toMatchObject({
       controllerLease: lease,
       ownsControl: true,
@@ -107,5 +112,19 @@ describe('workspace mirror renderer projection', () => {
       controllerLease: null,
       ownsControl: false,
     });
+  });
+
+  it('allows local mutations but requires control for a remote projection', () => {
+    useWorkspaceMirrorStore.setState({ projectionTarget: 'local', ownsControl: false });
+    expect(canMutateWorkspaceProjection()).toBe(true);
+
+    useWorkspaceMirrorStore.setState({ projectionTarget: 'remote', ownsControl: false });
+    expect(canMutateWorkspaceProjection()).toBe(false);
+
+    useWorkspaceMirrorStore.setState({ projectionTarget: 'remote', ownsControl: true });
+    expect(canMutateWorkspaceProjection()).toBe(true);
+
+    useWorkspaceMirrorStore.setState({ projectionTarget: 'transitioning', ownsControl: true });
+    expect(canMutateWorkspaceProjection()).toBe(false);
   });
 });

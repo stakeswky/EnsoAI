@@ -694,8 +694,8 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_GET_BOOTSTRAP_STATUS),
     dispatchIntent: (intent: WorkspaceSceneIntent): Promise<StateIntentResultFrame> =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_DISPATCH_INTENT, intent),
-    requestControl: (): Promise<ControllerLease> =>
-      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL),
+    requestControl: (allowTransfer = false): Promise<ControllerLease> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL, { allowTransfer }),
     releaseControl: (): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_RELEASE_CONTROL),
     resolveEntities: (requests: WorkspaceEntityLookup[]): Promise<WorkspaceEntityResolution[]> =>

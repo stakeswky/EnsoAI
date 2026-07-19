@@ -328,14 +328,18 @@ export class RemoteClientManager {
       mirrorRevision: conn.mirrorSnapshot?.revision,
       mirrorProtocol: conn.negotiatedProtocol,
       mirrorController: conn.mirrorLease,
-      mirrorOwnsControl: Boolean(
-        conn.mirrorLease?.holderClientId === conn.mirrorClientId &&
-          conn.mirrorLease.holderDeviceId === conn.mirrorDeviceId &&
-          conn.mirrorLease.graceUntil === null
-      ),
+      mirrorOwnsControl: this.ownsMirrorControl(conn),
       mirrorLastResyncReason: conn.mirrorLastResyncReason,
       error: conn.error,
     };
+  }
+
+  private ownsMirrorControl(conn: Connection): boolean {
+    return Boolean(
+      conn.mirrorLease?.holderClientId === conn.mirrorClientId &&
+        conn.mirrorLease.holderDeviceId === conn.mirrorDeviceId &&
+        conn.mirrorLease.graceUntil === null
+    );
   }
 
   /** First live/remote-attached connection snapshot (diagnostics / e2e). */
@@ -580,6 +584,12 @@ export class RemoteClientManager {
 
       const terminalSessionId = typeof sendArgs[0] === 'string' ? sendArgs[0] : null;
       const attachment = terminalSessionId ? conn.mirrorStreams.get(terminalSessionId) : undefined;
+      if (
+        (channel === IPC_CHANNELS.TERMINAL_WRITE || channel === IPC_CHANNELS.TERMINAL_RESIZE) &&
+        !this.ownsMirrorControl(conn)
+      ) {
+        return Promise.resolve(undefined);
+      }
       if (channel === IPC_CHANNELS.TERMINAL_ATTACH && terminalSessionId) {
         return this.forwardTerminalAttach(conn, terminalSessionId, sendArgs.slice(1));
       }
