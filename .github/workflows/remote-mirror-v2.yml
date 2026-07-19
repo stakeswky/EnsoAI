@@ -1,0 +1,73 @@
+name: Remote Mirror V2
+
+on:
+  pull_request:
+    paths:
+      - 'src/main/services/remote/**'
+      - 'src/main/services/workspace/**'
+      - 'src/shared/types/workspaceMirror.ts'
+      - 'src/shared/types/remote.ts'
+      - 'scripts/remote-mirror-e2e/**'
+      - 'package.json'
+      - '.github/workflows/remote-mirror-v2.yml'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'remote suite to run'
+        required: false
+        default: 'e2e'
+
+jobs:
+  remote-mirror-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Remote unit/integration transport
+        run: pnpm test:remote:transport
+      - name: Remote harness e2e contract
+        run: pnpm test:remote:e2e
+        env:
+          ENSO_REMOTE_MIRROR_TEST: '1'
+      - name: Build
+        run: pnpm build
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-mirror-v2-${{ github.run_id }}
+          path: .artifacts/remote-mirror-v2/**
+          if-no-files-found: warn
+
+  remote-mirror-reconnect:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:remote:reconnect
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-mirror-reconnect-${{ github.run_id }}
+          path: .artifacts/remote-mirror-v2/**
+          if-no-files-found: warn
