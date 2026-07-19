@@ -1,5 +1,12 @@
 import {
   IPC_CHANNELS,
+  WorkspaceEntityAdoptionResultSchema,
+  WorkspaceEntityIdSchema,
+  type WorkspaceEntityKind,
+  WorkspaceEntityLookupSchema,
+  type WorkspaceEntityReservation,
+  WorkspaceEntityReservationSchema,
+  WorkspaceEntityResolutionSchema,
   type WorkspaceResourceUpload,
   WorkspaceResourceUploadSchema,
   type WorkspaceSceneIntent,
@@ -13,9 +20,11 @@ import {
   remoteVirtualClientId,
 } from '../services/remote/RemoteHostServer';
 import * as todoService from '../services/todo/TodoService';
+import { WorkspaceEntityRegistryError } from '../services/workspace/WorkspaceEntityRegistry';
 import type { WorkspaceIntentActor } from '../services/workspace/WorkspaceMirrorService';
 import {
   completeWorkspaceMirrorBootstrap,
+  getWorkspaceEntityRegistry,
   getWorkspaceMirrorService,
   getWorkspaceResourceService,
 } from '../services/workspace/workspaceMirrorRuntime';
@@ -68,6 +77,26 @@ function broadcast(channel: string, payload: unknown): void {
   broadcastToRemoteClients(channel, payload);
 }
 
+function adoptionConflictEntityIds(error: WorkspaceEntityRegistryError): string[] | undefined {
+  const candidates = [
+    error.details.conflictingEntityIds,
+    error.details.entityIds,
+    error.details.entityId,
+  ];
+  const entityIds = [
+    ...new Set(
+      candidates.flatMap((candidate) =>
+        Array.isArray(candidate)
+          ? candidate.filter((value): value is string => typeof value === 'string')
+          : typeof candidate === 'string'
+            ? [candidate]
+            : []
+      )
+    ),
+  ];
+  return entityIds.length > 0 ? entityIds : undefined;
+}
+
 export function registerWorkspaceMirrorHandlers(): void {
   const service = getWorkspaceMirrorService();
   service.subscribe((event) => broadcast(IPC_CHANNELS.WORKSPACE_MIRROR_EVENT, event));
@@ -115,6 +144,91 @@ export function registerWorkspaceMirrorHandlers(): void {
       throw new Error(error.message);
     }
   });
+
+  ipcMain.handle(
+    IPC_CHANNELS.WORKSPACE_MIRROR_RESOLVE_ENTITIES,
+    async (event, candidates: unknown) => {
+      trackSender(event.sender);
+      const requests = WorkspaceEntityLookupSchema.array().max(10_000).parse(candidates);
+      return WorkspaceEntityResolutionSchema.array().parse(
+        await getWorkspaceEntityRegistry().resolveEntities(requests)
+      );
+    }
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.WORKSPACE_MIRROR_REGISTER_ENTITY,
+    async (event, kind: WorkspaceEntityKind, path: string) => {
+      trackSender(event.sender);
+      const request = WorkspaceEntityLookupSchema.parse({ kind, path });
+      return WorkspaceEntityReservationSchema.parse(
+        await getWorkspaceEntityRegistry().registerEntity(request.kind, request.path)
+      );
+    }
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.WORKSPACE_MIRROR_ADOPT_ENTITY,
+    async (event, kind: WorkspaceEntityKind, entityId: string, path: string) => {
+      trackSender(event.sender);
+      const request = WorkspaceEntityLookupSchema.parse({ kind, path });
+      const id = WorkspaceEntityIdSchema.parse(entityId);
+      const registry = getWorkspaceEntityRegistry();
+      let reservation: WorkspaceEntityReservation;
+      try {
+        reservation = await registry.adoptEntity(request.kind, id, request.path);
+      } catch (error) {
+        if (error instanceof WorkspaceEntityRegistryError && error.code.endsWith('_CONFLICT')) {
+          return WorkspaceEntityAdoptionResultSchema.parse({
+            ok: false,
+            error: {
+              code: 'ENTITY_ADOPTION_CONFLICT',
+              message: error.message,
+              conflictingEntityIds: adoptionConflictEntityIds(error),
+            },
+          });
+        }
+        throw error;
+      }
+      try {
+        if (request.kind === 'repository') {
+          await getWorkspaceMirrorService().upsertWorkspaceEntity({
+            kind: 'repository',
+            entityId: id,
+            path: reservation.path,
+          });
+        } else {
+          const worktree = getWorkspaceMirrorService().getSnapshot().catalog.worktrees[id];
+          if (!worktree) throw new Error('Workspace worktree adoption requires an active entity');
+          await getWorkspaceMirrorService().upsertWorkspaceEntity({
+            kind: 'worktree',
+            entityId: id,
+            repositoryId: worktree.repositoryId,
+            path: reservation.path,
+            branch: worktree.branch,
+          });
+        }
+      } catch (error) {
+        registry.discardReservation(id);
+        throw error;
+      }
+      const resolved = await registry.resolveEntity(request.kind, reservation.path);
+      if (resolved.status !== 'resolved' || resolved.entityId !== id || !resolved.durable) {
+        throw new Error('Workspace entity adoption did not commit atomically');
+      }
+      return WorkspaceEntityAdoptionResultSchema.parse({
+        ok: true,
+        reservation: WorkspaceEntityReservationSchema.parse({
+          sceneId: resolved.sceneId,
+          entityId: resolved.entityId,
+          kind: resolved.kind,
+          path: resolved.currentPath,
+          normalizedPath: resolved.normalizedPath,
+          disposition: reservation.disposition,
+        }),
+      });
+    }
+  );
 
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_MIRROR_COMPLETE_LEGACY_IMPORT, async (event) => {
     if (event.sender.id >= REMOTE_VIRTUAL_SENDER_ID_START) {

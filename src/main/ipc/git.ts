@@ -275,7 +275,7 @@ export function registerGitHandlers(): void {
       const resolved = validateWorkdir(workdir);
       const sender = event.sender;
 
-      startCodeReviewService({
+      await startCodeReviewService({
         workdir: resolved,
         provider: (options.provider ?? 'claude-code') as AIProvider,
         model: options.model as ModelId,

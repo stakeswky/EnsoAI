@@ -218,4 +218,14 @@ export function registerTerminalHandlers(): void {
     }
     return ptyManager.getProcessActivity(id);
   });
+
+  ipcMain.on(
+    IPC_CHANNELS.TERMINAL_STREAM_ACK,
+    async (event, id: string, payload: { streamSeq: number; creditBytes: number }) => {
+      if (typeof id === 'string' && id.startsWith('remote:')) {
+        const { remoteClientManager } = await import('../services/remote/RemoteClientManager');
+        remoteClientManager.ackStream(event.sender.id, id, payload);
+      }
+    }
+  );
 }

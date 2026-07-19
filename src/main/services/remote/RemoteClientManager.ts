@@ -3,6 +3,9 @@ import { readFile, stat } from 'node:fs/promises';
 import { basename, posix, win32 } from 'node:path';
 import {
   type ControllerLease,
+  canonicalJson,
+  decodeWorkspaceCommandArgs,
+  encodeWorkspaceCommandArgs,
   IPC_CHANNELS,
   REMOTE_FS_READ_FILE_CHANNEL,
   REMOTE_PROTOCOL_VERSION,
@@ -18,6 +21,8 @@ import {
   WORKSPACE_MIRROR_PROTOCOL_VERSION,
   WORKSPACE_MIRROR_SCHEMA_VERSION,
   WORKSPACE_MIRROR_SUBPROTOCOL,
+  type WorkspaceCommandExecuteFrame,
+  type WorkspaceMirrorError,
   type WorkspaceMirrorV2Frame,
   type WorkspaceResourceReference,
   type WorkspaceSceneEvent,
@@ -29,6 +34,7 @@ import type { WebContents } from 'electron';
 import WebSocket from 'ws';
 import { applyWorkspaceSceneEvent } from '../workspace/WorkspaceMirrorService';
 import type { RemoteDeviceIdentity } from './RemoteDeviceIdentityStore';
+import { getRemoteCommandDescriptor, getRemoteV2EventCapability } from './remoteCommandManifest';
 import { parseRemoteFrame } from './remoteFrameCodec';
 import { parseWorkspaceMirrorV2Frame, WorkspaceSnapshotAssembler } from './workspaceMirrorFrames';
 
@@ -37,6 +43,24 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const MAX_BUFFERED_MIRROR_EVENTS = 10_000;
+const WORKSPACE_COMMAND_VERSION = 1;
+const MIRROR_CLIENT_CAPABILITIES = [
+  'scene.snapshot',
+  'scene.replay',
+  'scene.intent',
+  'command.execute',
+  'control.lease',
+  'terminal.stream',
+  'agent.stream',
+  'resource.transfer',
+  'todo.mirror',
+] as const;
+const MIRROR_CLIENT_CAPABILITY_SET = new Set<string>(MIRROR_CLIENT_CAPABILITIES);
+const MIRROR_COORDINATION_COMMAND_CHANNELS = new Set<string>([
+  IPC_CHANNELS.FILE_WATCH_START,
+  IPC_CHANNELS.FILE_WATCH_STOP,
+  IPC_CHANNELS.WORKSPACE_MIRROR_MATERIALIZE_RESOURCE,
+]);
 
 /**
  * Remote PTY ids are prefixed on the client so they can never collide with
@@ -58,6 +82,30 @@ function stripRemotePtyId(id: unknown): unknown {
     : id;
 }
 
+export class RemoteWorkspaceCommandError extends Error {
+  readonly code: WorkspaceMirrorError['code'];
+  readonly retryable: boolean;
+  readonly details: WorkspaceMirrorError['details'];
+
+  constructor(error: WorkspaceMirrorError) {
+    super(`${error.code}: ${error.message}`);
+    this.name = 'RemoteWorkspaceCommandError';
+    this.code = error.code;
+    this.retryable = error.retryable;
+    this.details = error.details ? structuredClone(error.details) : undefined;
+  }
+}
+
+function digestWorkspaceCommand(
+  command: string,
+  commandVersion: number,
+  args: WorkspaceCommandExecuteFrame['args']
+): string {
+  return createHash('sha256')
+    .update(canonicalJson({ command, commandVersion, args }))
+    .digest('hex');
+}
+
 export function isRemoteHostPathWithinRoot(
   candidate: string,
   root: string,
@@ -65,17 +113,73 @@ export function isRemoteHostPathWithinRoot(
 ): boolean {
   const pathApi = platform === 'win32' ? win32 : posix;
   if (!pathApi.isAbsolute(candidate) || !pathApi.isAbsolute(root)) return false;
-  const normalize = (value: string): string => {
-    const resolved = pathApi.resolve(value);
-    return platform === 'win32' || platform === 'darwin' ? resolved.toLowerCase() : resolved;
-  };
-  const relativePath = pathApi.relative(normalize(root), normalize(candidate));
-  return (
-    relativePath === '' ||
-    (relativePath !== '..' &&
-      !relativePath.startsWith(`..${pathApi.sep}`) &&
-      !pathApi.isAbsolute(relativePath))
-  );
+  const resolvedCandidate = pathApi.normalize(pathApi.resolve(candidate));
+  const resolvedRoot = pathApi.normalize(pathApi.resolve(root));
+  if (resolvedCandidate === resolvedRoot) return true;
+  const rootPrefix = resolvedRoot.endsWith(pathApi.sep)
+    ? resolvedRoot
+    : `${resolvedRoot}${pathApi.sep}`;
+  return resolvedCandidate.startsWith(rootPrefix);
+}
+
+export function restoreMirrorCommandResult(
+  frame: WorkspaceCommandExecuteFrame,
+  result: unknown
+): unknown {
+  if (
+    frame.command === IPC_CHANNELS.WORKSPACE_MIRROR_ADOPT_ENTITY &&
+    result &&
+    typeof result === 'object' &&
+    !Array.isArray(result) &&
+    'ok' in result &&
+    result.ok === true &&
+    'reservation' in result &&
+    result.reservation &&
+    typeof result.reservation === 'object' &&
+    !Array.isArray(result.reservation) &&
+    'entityId' in result.reservation &&
+    !('path' in result.reservation)
+  ) {
+    const path = decodeWorkspaceCommandArgs(frame.args)[2];
+    if (typeof path !== 'string') {
+      throw new Error('remote entity adoption result is missing its target path');
+    }
+    return {
+      ...result,
+      reservation: { ...result.reservation, path, normalizedPath: path },
+    };
+  }
+  if (
+    frame.command === IPC_CHANNELS.WORKSPACE_MIRROR_REGISTER_ENTITY &&
+    result &&
+    typeof result === 'object' &&
+    !Array.isArray(result) &&
+    'entityId' in result &&
+    !('path' in result)
+  ) {
+    const args = decodeWorkspaceCommandArgs(frame.args);
+    const path = args[1];
+    if (typeof path !== 'string') {
+      throw new Error('remote entity result is missing its target path');
+    }
+    return { ...result, path, normalizedPath: path };
+  }
+  if (
+    frame.command !== IPC_CHANNELS.GIT_CLONE ||
+    !result ||
+    typeof result !== 'object' ||
+    Array.isArray(result) ||
+    !('success' in result) ||
+    result.success !== true ||
+    'path' in result
+  ) {
+    return result;
+  }
+  const targetPath = decodeWorkspaceCommandArgs(frame.args)[1];
+  if (typeof targetPath !== 'string') {
+    throw new Error('remote clone result is missing its target path');
+  }
+  return { ...result, path: targetPath };
 }
 
 interface PendingRequest {
@@ -87,6 +191,20 @@ interface PendingRequest {
 interface PendingMirrorIntent {
   intent: WorkspaceSceneIntent;
   resolve: (value: StateIntentResultFrame) => void;
+  reject: (reason: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+interface PendingMirrorCommand {
+  frame: WorkspaceCommandExecuteFrame;
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+  timer: NodeJS.Timeout | null;
+}
+
+interface PendingMirrorCoordination {
+  command: string;
+  resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   timer: NodeJS.Timeout;
 }
@@ -142,6 +260,9 @@ interface Connection {
   mirrorCoordSeq: number;
   mirrorLease: ControllerLease | null;
   mirrorPendingIntents: Map<string, PendingMirrorIntent>;
+  mirrorPendingCommands: Map<string, PendingMirrorCommand>;
+  mirrorPendingCoordination: Map<string, PendingMirrorCoordination>;
+  mirrorCommandSequence: number;
   mirrorPendingControls: Map<string, PendingMirrorControl>;
   mirrorPendingResourceUploads: Map<string, PendingResourceUpload>;
   mirrorStreams: Map<string, MirrorStreamAttachment>;
@@ -217,6 +338,25 @@ export class RemoteClientManager {
     };
   }
 
+  /** First live/remote-attached connection snapshot (diagnostics / e2e). */
+  getPrimaryRemoteSnapshot(): {
+    status: RemoteClientStatus;
+    snapshot: WorkspaceSceneSnapshot | null;
+  } | null {
+    for (const conn of this.connections.values()) {
+      if (conn.state !== 'connected') continue;
+      return {
+        status: this.getStatus(conn.wc.id),
+        snapshot: conn.mirrorSnapshot ? structuredClone(conn.mirrorSnapshot) : null,
+      };
+    }
+    return null;
+  }
+
+  listConnectionStatuses(): RemoteClientStatus[] {
+    return [...this.connections.keys()].map((id) => this.getStatus(id));
+  }
+
   async connect(
     wc: WebContents,
     options: RemoteConnectOptions,
@@ -249,6 +389,9 @@ export class RemoteClientManager {
       mirrorCoordSeq: 0,
       mirrorLease: null,
       mirrorPendingIntents: new Map(),
+      mirrorPendingCommands: new Map(),
+      mirrorPendingCoordination: new Map(),
+      mirrorCommandSequence: 0,
       mirrorPendingControls: new Map(),
       mirrorPendingResourceUploads: new Map(),
       mirrorStreams: new Map(),
@@ -455,6 +598,43 @@ export class RemoteClientManager {
         this.detachMirrorStream(conn, attachment);
         return Promise.resolve(true);
       }
+
+      const descriptor = getRemoteCommandDescriptor(channel);
+      if (!descriptor) {
+        return Promise.reject(new Error(`remote channel is not classified: ${channel}`));
+      }
+      if (descriptor.route === 'v2-forbidden') {
+        return Promise.reject(new Error(`remote channel is unavailable in mirror V2: ${channel}`));
+      }
+      if (descriptor.route === 'durable-command') {
+        return this.executeMirrorCommand(conn, channel, sendArgs).then((value) =>
+          channel === IPC_CHANNELS.TERMINAL_CREATE && typeof value === 'string'
+            ? `${REMOTE_PTY_PREFIX}${value}`
+            : value
+        );
+      }
+      if (descriptor.route === 'stream/coordination') {
+        if (MIRROR_COORDINATION_COMMAND_CHANNELS.has(channel)) {
+          if (channel === IPC_CHANNELS.FILE_WATCH_STOP) {
+            conn.persistentRequests.delete(
+              this.persistentRequestKey(IPC_CHANNELS.FILE_WATCH_START, sendArgs)
+            );
+          }
+          return this.forwardMirrorCoordination(conn, channel, sendArgs).then((value) => {
+            if (channel === IPC_CHANNELS.FILE_WATCH_START) {
+              conn.persistentRequests.set(this.persistentRequestKey(channel, sendArgs), {
+                channel,
+                args: structuredClone(sendArgs),
+              });
+            }
+            return value;
+          });
+        }
+        return Promise.reject(
+          new Error(`remote channel requires its workspace coordination plane: ${channel}`)
+        );
+      }
+      return this.forwardLegacy(conn, channel, encodeWorkspaceCommandArgs(sendArgs));
     }
 
     if (channel === IPC_CHANNELS.FILE_WATCH_STOP) {
@@ -489,6 +669,97 @@ export class RemoteClientManager {
         timer,
       });
       conn.ws?.send(JSON.stringify({ t: 'req', id, ch: channel, args }));
+    });
+  }
+
+  private executeMirrorCommand(
+    conn: Connection,
+    command: string,
+    args: unknown[]
+  ): Promise<unknown> {
+    const durableArgs =
+      command === IPC_CHANNELS.TERMINAL_CREATE &&
+      args[0] !== null &&
+      typeof args[0] === 'object' &&
+      !Array.isArray(args[0])
+        ? [
+            {
+              ...(args[0] as Record<string, unknown>),
+              sessionId:
+                typeof (args[0] as Record<string, unknown>).sessionId === 'string'
+                  ? (args[0] as Record<string, unknown>).sessionId
+                  : `terminal-${randomUUID()}`,
+              persistent: true,
+            },
+            ...args.slice(1),
+          ]
+        : args;
+    const commandArgs = encodeWorkspaceCommandArgs(durableArgs);
+    const commandVersion = WORKSPACE_COMMAND_VERSION;
+    const frame: WorkspaceCommandExecuteFrame = {
+      t: 'command.execute',
+      operationId: `command-${randomUUID()}`,
+      clientSeq: ++conn.mirrorCommandSequence,
+      command,
+      commandVersion,
+      requestDigest: digestWorkspaceCommand(command, commandVersion, commandArgs),
+      args: commandArgs,
+    };
+    return new Promise((resolve, reject) => {
+      const pending: PendingMirrorCommand = { frame, resolve, reject, timer: null };
+      conn.mirrorPendingCommands.set(frame.operationId, pending);
+      this.armMirrorCommandStatus(conn, pending);
+      conn.ws?.send(JSON.stringify(frame));
+    });
+  }
+
+  private armMirrorCommandStatus(conn: Connection, pending: PendingMirrorCommand): void {
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.timer = setTimeout(() => {
+      if (conn.mirrorPendingCommands.get(pending.frame.operationId) !== pending) return;
+      this.sendMirrorCommandStatus(conn, pending.frame.operationId);
+      this.armMirrorCommandStatus(conn, pending);
+    }, REQUEST_TIMEOUT_MS);
+  }
+
+  private sendMirrorCommandStatus(conn: Connection, operationId: string): void {
+    if (!this.hasMirrorSocket(conn)) return;
+    conn.ws?.send(
+      JSON.stringify({
+        t: 'command.status',
+        requestId: operationId,
+        operationId,
+      })
+    );
+  }
+
+  private resendPendingMirrorCommands(conn: Connection): void {
+    for (const operationId of conn.mirrorPendingCommands.keys()) {
+      this.sendMirrorCommandStatus(conn, operationId);
+    }
+  }
+
+  private forwardMirrorCoordination(
+    conn: Connection,
+    command: string,
+    args: unknown[]
+  ): Promise<unknown> {
+    const requestId = `coord-${randomUUID()}`;
+    const commandArgs = encodeWorkspaceCommandArgs(args);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        conn.mirrorPendingCoordination.delete(requestId);
+        reject(new Error(`workspace coordination request timed out: ${command}`));
+      }, REQUEST_TIMEOUT_MS);
+      conn.mirrorPendingCoordination.set(requestId, { command, resolve, reject, timer });
+      conn.ws?.send(
+        JSON.stringify({
+          t: 'coord.command',
+          requestId,
+          command,
+          args: commandArgs,
+        })
+      );
     });
   }
 
@@ -805,6 +1076,30 @@ export class RemoteClientManager {
     }
   }
 
+  ackStream(
+    senderId: number,
+    id: string,
+    payload: { streamSeq: number; creditBytes: number }
+  ): void {
+    const conn = this.connections.get(senderId);
+    if (!conn) return;
+    const remotePtyId = id.startsWith('remote:') ? id.slice('remote:'.length) : id;
+    const attachment = conn.mirrorStreams.get(remotePtyId);
+    if (!attachment) return;
+    if (!this.hasMirrorSocket(conn)) return;
+    conn.ws?.send(
+      JSON.stringify({
+        t: 'stream.ack',
+        streamId: attachment.streamId,
+        streamKind: attachment.streamKind,
+        entityId: attachment.entityId,
+        entityGeneration: attachment.entityGeneration,
+        consumedStreamSeq: payload.streamSeq,
+        creditBytes: payload.creditBytes,
+      })
+    );
+  }
+
   private rejectPendingMirrorStreamAttaches(conn: Connection, error: Error): void {
     for (const attachment of conn.mirrorStreams.values()) {
       if (!attachment.pendingAttach) continue;
@@ -907,6 +1202,16 @@ export class RemoteClientManager {
           return;
         }
 
+        if (frame.t === 'protocol.error') {
+          if (!settled) {
+            settled = true;
+            clearTimeout(helloTimer);
+            reject(new Error(`${frame.code}: ${frame.message}`));
+          }
+          ws.close(4406, frame.code);
+          return;
+        }
+
         if (frame.t === 'hello') {
           if (settled) {
             ws.close(4400, 'duplicate handshake');
@@ -964,6 +1269,16 @@ export class RemoteClientManager {
         }
 
         if (frame.t === 'ev' && !conn.wc.isDestroyed()) {
+          if (ws.protocol === WORKSPACE_MIRROR_SUBPROTOCOL) {
+            const capability = getRemoteV2EventCapability(frame.ch);
+            if (
+              capability === undefined ||
+              (capability !== null && !MIRROR_CLIENT_CAPABILITY_SET.has(capability))
+            ) {
+              ws.close(4400, 'unclassified V2 event');
+              return;
+            }
+          }
           let payload = frame.payload;
           // Prefix PTY ids in terminal push events to match client-side ids
           if (
@@ -1129,6 +1444,7 @@ export class RemoteClientManager {
         conn.mirrorSyncPhase = 'syncing';
         this.sendMirrorSubscribe(conn);
         this.restorePersistentRequests(conn);
+        this.resendPendingMirrorCommands(conn);
       }
       this.pushStatus(conn);
       return;
@@ -1273,6 +1589,54 @@ export class RemoteClientManager {
       }
       return;
     }
+    if (frame.t === 'command.result') {
+      const pending = conn.mirrorPendingCommands.get(frame.operationId);
+      if (!pending) return;
+      if (
+        frame.command !== pending.frame.command ||
+        frame.commandVersion !== pending.frame.commandVersion ||
+        frame.requestDigest !== pending.frame.requestDigest
+      ) {
+        conn.mirrorPendingCommands.delete(frame.operationId);
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.reject(new Error('remote command result binding mismatch'));
+        return;
+      }
+      if (frame.state === 'prepared' || frame.state === 'executing') {
+        this.armMirrorCommandStatus(conn, pending);
+        return;
+      }
+      conn.mirrorPendingCommands.delete(frame.operationId);
+      if (pending.timer) clearTimeout(pending.timer);
+      if (frame.state === 'committed') {
+        if (frame.resultExpired) {
+          pending.reject(new RemoteWorkspaceCommandError(frame.error));
+        } else {
+          try {
+            pending.resolve(restoreMirrorCommandResult(pending.frame, frame.result));
+          } catch (error) {
+            pending.reject(error instanceof Error ? error : new Error(String(error)));
+          }
+        }
+      } else {
+        pending.reject(new RemoteWorkspaceCommandError(frame.error));
+      }
+      return;
+    }
+    if (frame.t === 'coord.commandResult') {
+      const pending = conn.mirrorPendingCoordination.get(frame.requestId);
+      if (!pending) return;
+      conn.mirrorPendingCoordination.delete(frame.requestId);
+      clearTimeout(pending.timer);
+      if (pending.command !== frame.command) {
+        pending.reject(new Error('workspace coordination result binding mismatch'));
+      } else if (frame.ok) {
+        pending.resolve(frame.result);
+      } else {
+        pending.reject(new Error(`${frame.error.code}: ${frame.error.message}`));
+      }
+      return;
+    }
     if (frame.t === 'stream.attached') {
       const attachment = [...conn.mirrorStreams.values()].find(
         (candidate) => candidate.streamId === frame.streamId
@@ -1371,6 +1735,25 @@ export class RemoteClientManager {
           clearTimeout(intent.timer);
           intent.reject(new Error(frame.error.message));
         }
+        const command = conn.mirrorPendingCommands.get(frame.requestId);
+        if (command) {
+          matchedRequest = true;
+          if (frame.error.code === 'UNKNOWN_OPERATION' && this.hasMirrorSocket(conn)) {
+            conn.ws?.send(JSON.stringify(command.frame));
+            this.armMirrorCommandStatus(conn, command);
+          } else {
+            conn.mirrorPendingCommands.delete(frame.requestId);
+            if (command.timer) clearTimeout(command.timer);
+            command.reject(new Error(`${frame.error.code}: ${frame.error.message}`));
+          }
+        }
+        const coordination = conn.mirrorPendingCoordination.get(frame.requestId);
+        if (coordination) {
+          matchedRequest = true;
+          conn.mirrorPendingCoordination.delete(frame.requestId);
+          clearTimeout(coordination.timer);
+          coordination.reject(new Error(`${frame.error.code}: ${frame.error.message}`));
+        }
         const upload = conn.mirrorPendingResourceUploads.get(frame.requestId);
         if (upload) {
           matchedRequest = true;
@@ -1417,16 +1800,7 @@ export class RemoteClientManager {
         schemaVersions: [WORKSPACE_MIRROR_SCHEMA_VERSION],
         deviceId: conn.mirrorDeviceId,
         clientId: conn.mirrorClientId,
-        capabilities: [
-          'scene.snapshot',
-          'scene.replay',
-          'scene.intent',
-          'control.lease',
-          'terminal.stream',
-          'agent.stream',
-          'resource.transfer',
-          'todo.mirror',
-        ],
+        capabilities: MIRROR_CLIENT_CAPABILITIES,
         resumeCursor,
       })
     );
@@ -1438,7 +1812,12 @@ export class RemoteClientManager {
 
   private restorePersistentRequests(conn: Connection): void {
     for (const request of conn.persistentRequests.values()) {
-      void this.forwardLegacy(conn, request.channel, request.args).catch(() => undefined);
+      const descriptor = getRemoteCommandDescriptor(request.channel);
+      const restored =
+        descriptor?.route === 'stream/coordination'
+          ? this.forwardMirrorCoordination(conn, request.channel, request.args)
+          : this.forwardLegacy(conn, request.channel, request.args);
+      void restored.catch(() => undefined);
     }
   }
 
@@ -1491,6 +1870,16 @@ export class RemoteClientManager {
       pending.reject(new Error('remote connection disposed'));
     }
     conn.mirrorPendingIntents.clear();
+    for (const pending of conn.mirrorPendingCommands.values()) {
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.reject(new Error('remote connection disposed'));
+    }
+    conn.mirrorPendingCommands.clear();
+    for (const pending of conn.mirrorPendingCoordination.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('remote connection disposed'));
+    }
+    conn.mirrorPendingCoordination.clear();
     for (const pending of conn.mirrorPendingControls.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('remote connection disposed'));
@@ -1539,6 +1928,16 @@ export class RemoteClientManager {
       pending.reject(new Error(error));
     }
     conn.mirrorPendingIntents.clear();
+    for (const pending of conn.mirrorPendingCommands.values()) {
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.reject(new Error(error));
+    }
+    conn.mirrorPendingCommands.clear();
+    for (const pending of conn.mirrorPendingCoordination.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(error));
+    }
+    conn.mirrorPendingCoordination.clear();
     for (const pending of conn.mirrorPendingControls.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error(error));

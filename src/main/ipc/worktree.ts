@@ -33,15 +33,7 @@ export function clearAllWorktreeServices(): void {
 export function registerWorktreeHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.WORKTREE_LIST, async (_, workdir: string) => {
     const service = getWorktreeService(workdir);
-    const worktrees = await service.list();
-
-    // Register all worktrees with auto-fetch service
-    gitAutoFetchService.clearWorktrees();
-    for (const wt of worktrees) {
-      gitAutoFetchService.registerWorktree(wt.path);
-    }
-
-    return worktrees;
+    return service.list();
   });
 
   ipcMain.handle(
@@ -49,6 +41,7 @@ export function registerWorktreeHandlers(): void {
     async (_, workdir: string, options: WorktreeCreateOptions) => {
       const service = getWorktreeService(workdir);
       await service.add(options);
+      gitAutoFetchService.registerWorktree(options.path);
     }
   );
 

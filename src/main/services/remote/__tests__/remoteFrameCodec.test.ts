@@ -42,4 +42,20 @@ describe('remote frame codec', () => {
     );
     expect(isRemoteHelloFrame(frame)).toBe(true);
   });
+
+  it('parses the stable V2 upgrade requirement before legacy dispatch', () => {
+    expect(
+      parseRemoteFrame(
+        JSON.stringify({
+          t: 'protocol.error',
+          code: 'UPGRADE_REQUIRED',
+          message: 'Workspace mirror V2 is required',
+        })
+      )
+    ).toEqual({
+      t: 'protocol.error',
+      code: 'UPGRADE_REQUIRED',
+      message: 'Workspace mirror V2 is required',
+    });
+  });
 });

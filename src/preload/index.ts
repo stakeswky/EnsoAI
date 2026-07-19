@@ -55,6 +55,11 @@ import type {
   TerminalStreamReset,
   ValidateLocalPathResult,
   ValidateUrlResult,
+  WorkspaceEntityAdoptionResult,
+  WorkspaceEntityKind,
+  WorkspaceEntityLookup,
+  WorkspaceEntityReservation,
+  WorkspaceEntityResolution,
   WorkspaceResourceReference,
   WorkspaceSceneEvent,
   WorkspaceSceneIntent,
@@ -420,8 +425,11 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_LIST_PERSISTENT),
     getActivity: (id: string): Promise<boolean> =>
       ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_GET_ACTIVITY, id),
-    onData: (callback: (event: { id: string; data: string }) => void): (() => void) => {
-      const handler = (_: unknown, event: { id: string; data: string }) => callback(event);
+    onData: (
+      callback: (event: { id: string; data: string; streamSeq?: number }) => void
+    ): (() => void) => {
+      const handler = (_: unknown, event: { id: string; data: string; streamSeq?: number }) =>
+        callback(event);
       ipcRenderer.on(IPC_CHANNELS.TERMINAL_DATA, handler);
       return () => ipcRenderer.off(IPC_CHANNELS.TERMINAL_DATA, handler);
     },
@@ -437,6 +445,9 @@ const electronAPI = {
       const handler = (_: unknown, event: TerminalStreamReset) => callback(event);
       ipcRenderer.on(IPC_CHANNELS.TERMINAL_STREAM_RESET, handler);
       return () => ipcRenderer.off(IPC_CHANNELS.TERMINAL_STREAM_RESET, handler);
+    },
+    ackStream: (id: string, payload: { streamSeq: number; creditBytes: number }): void => {
+      ipcRenderer.send(IPC_CHANNELS.TERMINAL_STREAM_ACK, id, payload);
     },
   },
 
@@ -687,6 +698,19 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL),
     releaseControl: (): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_RELEASE_CONTROL),
+    resolveEntities: (requests: WorkspaceEntityLookup[]): Promise<WorkspaceEntityResolution[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_RESOLVE_ENTITIES, requests),
+    registerEntity: (
+      kind: WorkspaceEntityKind,
+      path: string
+    ): Promise<WorkspaceEntityReservation> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_REGISTER_ENTITY, kind, path),
+    adoptEntity: (
+      kind: WorkspaceEntityKind,
+      entityId: string,
+      path: string
+    ): Promise<WorkspaceEntityAdoptionResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_ADOPT_ENTITY, kind, entityId, path),
     stageResource: (sourcePath: string, mime?: string): Promise<WorkspaceResourceReference> =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_MIRROR_STAGE_RESOURCE, sourcePath, mime),
     materializeResource: (resourceId: string): Promise<string> =>

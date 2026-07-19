@@ -453,7 +453,7 @@ describe('Remote Workspace Mirror security boundaries', () => {
     await expect(runtime.getWorkspaceMirrorService().getControllerLease()).resolves.toBeNull();
   });
 
-  it('requires terminal.stream for every terminal compatibility RPC', async () => {
+  it('keeps terminal mutations off compatibility RPC and requires terminal.stream when typed', async () => {
     const { publicKey, privateKey } = generateKeyPairSync('ed25519');
     const { runtime, status } = await startHost();
     const { socket, frames } = openV2Socket(status.port);
@@ -462,7 +462,7 @@ describe('Remote Workspace Mirror security boundaries', () => {
       socket,
       frames,
       { deviceId: 'device-without-terminal-stream', publicKey, privateKey },
-      ['scene.snapshot', 'control.lease']
+      ['scene.snapshot', 'command.execute', 'control.lease']
     );
     socket.send(
       JSON.stringify({
@@ -474,26 +474,70 @@ describe('Remote Workspace Mirror security boundaries', () => {
     await frames.next((frame) => frame.t === 'control.granted');
 
     const requests = [
-      { ch: IPC_CHANNELS.TERMINAL_CREATE, args: [{ cwd: temporaryDirectory }] },
-      { ch: IPC_CHANNELS.TERMINAL_WRITE, args: ['terminal-unknown', 'input'] },
+      {
+        ch: IPC_CHANNELS.TERMINAL_CREATE,
+        args: [{ cwd: temporaryDirectory }],
+        error: 'command.execute',
+      },
+      {
+        ch: IPC_CHANNELS.TERMINAL_WRITE,
+        args: ['terminal-unknown', 'input'],
+        error: 'coordination plane',
+      },
       {
         ch: IPC_CHANNELS.TERMINAL_RESIZE,
         args: ['terminal-unknown', { cols: 80, rows: 24 }],
+        error: 'coordination plane',
       },
-      { ch: IPC_CHANNELS.TERMINAL_DESTROY, args: ['terminal-unknown'] },
-      { ch: IPC_CHANNELS.TERMINAL_LIST_PERSISTENT, args: [] },
-      { ch: IPC_CHANNELS.TERMINAL_GET_ACTIVITY, args: ['terminal-unknown'] },
+      {
+        ch: IPC_CHANNELS.TERMINAL_DESTROY,
+        args: ['terminal-unknown'],
+        error: 'command.execute',
+      },
+      { ch: IPC_CHANNELS.TERMINAL_LIST_PERSISTENT, args: [], error: 'terminal.stream' },
+      {
+        ch: IPC_CHANNELS.TERMINAL_GET_ACTIVITY,
+        args: ['terminal-unknown'],
+        error: 'terminal.stream',
+      },
     ];
     for (const [index, request] of requests.entries()) {
       const id = 900 + index;
-      socket.send(JSON.stringify({ t: 'req', id, ...request }));
+      const { error: expectedError, ...remoteRequest } = request;
+      socket.send(JSON.stringify({ t: 'req', id, ...remoteRequest }));
       await expect(
         frames.next((frame) => frame.t === 'res' && frame.id === id)
       ).resolves.toMatchObject({
         ok: false,
-        error: expect.stringContaining('terminal.stream'),
+        error: expect.stringContaining(expectedError),
       });
     }
+    const { digestWorkspaceCommandRequest, WORKSPACE_COMMAND_VERSION } = await import(
+      '../../workspace/WorkspaceCommandRegistry'
+    );
+    const commandArgs = [{ cwd: temporaryDirectory }];
+    socket.send(
+      JSON.stringify({
+        t: 'command.execute',
+        operationId: 'terminal-without-capability',
+        clientSeq: 1,
+        command: IPC_CHANNELS.TERMINAL_CREATE,
+        commandVersion: WORKSPACE_COMMAND_VERSION,
+        requestDigest: digestWorkspaceCommandRequest(
+          IPC_CHANNELS.TERMINAL_CREATE,
+          WORKSPACE_COMMAND_VERSION,
+          commandArgs
+        ),
+        args: commandArgs,
+      })
+    );
+    await expect(
+      frames.next(
+        (frame) => frame.t === 'error' && frame.requestId === 'terminal-without-capability'
+      )
+    ).resolves.toMatchObject({
+      error: { code: 'FORBIDDEN', message: expect.stringContaining('capability') },
+    });
     expect(runtime.getWorkspaceMirrorService().getSnapshot().terminals.sessions).toEqual({});
   });
 
@@ -540,12 +584,10 @@ describe('Remote Workspace Mirror security boundaries', () => {
     const unrelated = join(temporaryDirectory, 'unrelated');
     const targetDir = join(repository, 'target');
     const source = join(repository, 'source.txt');
-    await Promise.all([
-      mkdir(repository),
-      mkdir(existingWorktree),
-      mkdir(unrelated),
-      mkdir(targetDir, { recursive: true }),
-    ]);
+    await mkdir(repository, { recursive: true });
+    await mkdir(existingWorktree, { recursive: true });
+    await mkdir(unrelated, { recursive: true });
+    await mkdir(targetDir, { recursive: true });
     await writeFile(source, 'source');
     const roots = [repository, existingWorktree];
     const newSibling = join(temporaryDirectory, 'new-worktree');
@@ -573,6 +615,46 @@ describe('Remote Workspace Mirror security boundaries', () => {
         roots
       )
     ).resolves.toBe(false);
+
+    await expect(
+      validateV2WorkspaceRpcPaths(
+        IPC_CHANNELS.GIT_COMMIT_SHOW,
+        [repository, '0123456789abcdef0123456789abcdef01234567'],
+        roots
+      )
+    ).resolves.toBe(true);
+    await expect(
+      validateV2WorkspaceRpcPaths(
+        IPC_CHANNELS.GIT_COMMIT_SHOW,
+        [repository, `--output=${join(unrelated, 'written-by-git')}`],
+        roots
+      )
+    ).resolves.toBe(false);
+    await expect(
+      validateV2WorkspaceRpcPaths(
+        IPC_CHANNELS.GIT_COMMIT_DIFF,
+        [repository, '0123456789abcdef0123456789abcdef01234567', source, 'M', undefined],
+        roots
+      )
+    ).resolves.toBe(true);
+    await expect(
+      validateV2WorkspaceRpcPaths(
+        IPC_CHANNELS.GIT_COMMIT_DIFF,
+        [
+          repository,
+          '0123456789abcdef0123456789abcdef01234567',
+          join(unrelated, 'outside.txt'),
+          'M',
+          undefined,
+        ],
+        roots
+      )
+    ).resolves.toBe(false);
+    for (const channel of [IPC_CHANNELS.GIT_SUBMODULE_INIT, IPC_CHANNELS.GIT_SUBMODULE_UPDATE]) {
+      await expect(validateV2WorkspaceRpcPaths(channel, [repository, true], roots)).resolves.toBe(
+        true
+      );
+    }
     await expect(
       validateV2WorkspaceRpcPaths(
         IPC_CHANNELS.GIT_CLONE,
@@ -697,6 +779,14 @@ describe('Remote Workspace Mirror security boundaries', () => {
         roots
       )
     ).resolves.toBe(false);
+    for (const channel of [
+      IPC_CHANNELS.GIT_SUBMODULE_CHANGES,
+      IPC_CHANNELS.GIT_SUBMODULE_BRANCHES,
+    ]) {
+      await expect(
+        validateV2WorkspaceRpcPaths(channel, [repository, linkedDirectory], roots)
+      ).resolves.toBe(false);
+    }
   });
 
   it('does not expose an empty snapshot while the host is bootstrapping', async () => {

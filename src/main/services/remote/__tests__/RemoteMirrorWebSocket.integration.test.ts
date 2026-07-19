@@ -51,6 +51,24 @@ describe('Remote Workspace Mirror V2 WebSocket', () => {
     await runtime.completeWorkspaceMirrorBootstrap();
     cleanupRuntime = runtime.cleanupWorkspaceMirrorRuntime;
 
+    const { ipcMain } = await import('electron');
+    const { installIpcInterceptor } = await import('../handlerRegistry');
+    installIpcInterceptor();
+    const { registerWorkspaceMirrorHandlers } = await import('../../../ipc/workspaceMirror');
+    registerWorkspaceMirrorHandlers();
+    const terminalCreateHandler = vi.fn(
+      async (_event: unknown, _options: unknown) => 'pty-command-test'
+    );
+    const watchStartHandler = vi.fn(async () => undefined);
+    const watchStopHandler = vi.fn(async () => undefined);
+    const genericMutationHandler = vi.fn(async () => undefined);
+    const forbiddenMutationHandler = vi.fn(async () => undefined);
+    ipcMain.handle(IPC_CHANNELS.TERMINAL_CREATE, terminalCreateHandler);
+    ipcMain.handle(IPC_CHANNELS.FILE_WATCH_START, watchStartHandler);
+    ipcMain.handle(IPC_CHANNELS.FILE_WATCH_STOP, watchStopHandler);
+    ipcMain.handle(IPC_CHANNELS.FILE_CREATE_DIR, genericMutationHandler);
+    ipcMain.handle(IPC_CHANNELS.TODO_ADD_TASK, forbiddenMutationHandler);
+
     const { RemoteHostServer } = await import('../RemoteHostServer');
     const server = new RemoteHostServer();
     stopServer = () => server.stop();
@@ -64,6 +82,22 @@ describe('Remote Workspace Mirror V2 WebSocket', () => {
     });
     expect(status.running).toBe(true);
     expect(status.port).toBeGreaterThan(0);
+
+    const legacySocket = new WebSocket(`ws://127.0.0.1:${status.port}/`, {
+      headers: { [REMOTE_TOKEN_HEADER]: token },
+    });
+    const legacyError = new Promise<Record<string, unknown>>((resolve, reject) => {
+      legacySocket.once('message', (raw) => resolve(JSON.parse(raw.toString())));
+      legacySocket.once('error', reject);
+    });
+    const legacyClose = new Promise<void>((resolve) => {
+      legacySocket.once('close', () => resolve());
+    });
+    await expect(legacyError).resolves.toMatchObject({
+      t: 'protocol.error',
+      code: 'UPGRADE_REQUIRED',
+    });
+    await legacyClose;
 
     const socket = new WebSocket(`ws://127.0.0.1:${status.port}/`, WORKSPACE_MIRROR_SUBPROTOCOL, {
       headers: { [REMOTE_TOKEN_HEADER]: token },
@@ -88,8 +122,12 @@ describe('Remote Workspace Mirror V2 WebSocket', () => {
         setTimeout(() => {
           const index = waiters.indexOf(waiter);
           if (index >= 0) waiters.splice(index, 1);
-          reject(new Error('timed out waiting for WebSocket frame'));
-        }, 5_000);
+          reject(
+            new Error(
+              `timed out waiting for WebSocket frame; recent frames: ${JSON.stringify(frames.slice(-5))}`
+            )
+          );
+        }, 3_000);
       });
     };
 
@@ -115,7 +153,14 @@ describe('Remote Workspace Mirror V2 WebSocket', () => {
         schemaVersions: [WORKSPACE_MIRROR_SCHEMA_VERSION],
         deviceId: 'device-integration',
         clientId: 'client-integration',
-        capabilities: ['scene.snapshot', 'scene.replay', 'scene.intent', 'control.lease'],
+        capabilities: [
+          'scene.snapshot',
+          'scene.replay',
+          'scene.intent',
+          'command.execute',
+          'control.lease',
+          'terminal.stream',
+        ],
         resumeCursor: null,
       })
     );
@@ -159,9 +204,28 @@ describe('Remote Workspace Mirror V2 WebSocket', () => {
         operationId: 'operation-1',
         clientSeq: 1,
         baseRevision: 0,
-        kind: 'navigation.replace',
+        kind: 'scene.replace',
         payload: {
+          catalog: {
+            groups: {},
+            repositories: {
+              'repo-integration': {
+                id: 'repo-integration',
+                path: temporaryDirectory,
+                name: 'integration',
+                groupId: null,
+                order: 0,
+                settings: { autoInitWorktree: false, initScript: '', hidden: false },
+              },
+            },
+            worktrees: {},
+          },
           navigation: { ...snapshot.navigation, activePrimaryPanel: 'terminal' },
+          editors: snapshot.editors,
+          agents: snapshot.agents,
+          terminals: snapshot.terminals,
+          todos: snapshot.todos,
+          selections: snapshot.selections,
         },
       })
     );
@@ -171,6 +235,127 @@ describe('Remote Workspace Mirror V2 WebSocket', () => {
     );
     expect(event.revision).toBe(1);
     expect(result).toMatchObject({ accepted: true, committedRevision: 1 });
+
+    socket.send(
+      JSON.stringify({
+        t: 'req',
+        id: 901,
+        ch: IPC_CHANNELS.FILE_CREATE_DIR,
+        args: [join(temporaryDirectory, 'legacy-write')],
+      })
+    );
+    await expect(next((frame) => frame.t === 'res' && frame.id === 901)).resolves.toMatchObject({
+      ok: false,
+      error: 'use command.execute for durable workspace commands',
+    });
+    socket.send(
+      JSON.stringify({
+        t: 'req',
+        id: 902,
+        ch: IPC_CHANNELS.TODO_ADD_TASK,
+        args: [temporaryDirectory, { title: 'forbidden' }],
+      })
+    );
+    await expect(next((frame) => frame.t === 'res' && frame.id === 902)).resolves.toMatchObject({
+      ok: false,
+      error: 'channel is not available in workspace mirror V2',
+    });
+    expect(genericMutationHandler).not.toHaveBeenCalled();
+    expect(forbiddenMutationHandler).not.toHaveBeenCalled();
+
+    const { REMOTE_COMMAND_MANIFEST } = await import('../remoteCommandManifest');
+    const nonCompatibilityRoutes = Object.values(REMOTE_COMMAND_MANIFEST).filter(
+      (descriptor) => descriptor.route !== 'read-only'
+    );
+    for (const [index, descriptor] of nonCompatibilityRoutes.entries()) {
+      const id = 1_000 + index;
+      socket.send(JSON.stringify({ t: 'req', id, ch: descriptor.channel, args: [] }));
+      const expectedError =
+        descriptor.route === 'durable-command'
+          ? 'use command.execute'
+          : descriptor.route === 'stream/coordination'
+            ? 'coordination plane'
+            : 'not available in workspace mirror V2';
+      await expect(next((frame) => frame.t === 'res' && frame.id === id)).resolves.toMatchObject({
+        ok: false,
+        error: expect.stringContaining(expectedError),
+      });
+    }
+    expect(genericMutationHandler).not.toHaveBeenCalled();
+    expect(forbiddenMutationHandler).not.toHaveBeenCalled();
+
+    const { digestWorkspaceCommandRequest, WORKSPACE_COMMAND_VERSION } = await import(
+      '../../workspace/WorkspaceCommandRegistry'
+    );
+    const commandArgs = [
+      {
+        cwd: temporaryDirectory,
+        title: 'first',
+        sessionId: 'terminal-durable-command-1',
+        persistent: true,
+      },
+    ];
+    const command = {
+      t: 'command.execute',
+      operationId: 'durable-command-1',
+      clientSeq: 2,
+      command: IPC_CHANNELS.TERMINAL_CREATE,
+      commandVersion: WORKSPACE_COMMAND_VERSION,
+      requestDigest: digestWorkspaceCommandRequest(
+        IPC_CHANNELS.TERMINAL_CREATE,
+        WORKSPACE_COMMAND_VERSION,
+        commandArgs
+      ),
+      args: commandArgs,
+    } as const;
+    socket.send(JSON.stringify(command));
+    await expect(
+      next(
+        (frame) =>
+          frame.t === 'command.result' &&
+          frame.operationId === command.operationId &&
+          frame.resultExpired === false
+      )
+    ).resolves.toMatchObject({ state: 'committed', result: 'pty-command-test' });
+    socket.send(JSON.stringify(command));
+    await expect(
+      next(
+        (frame) =>
+          frame.t === 'command.result' &&
+          frame.operationId === command.operationId &&
+          frame.resultExpired === false
+      )
+    ).resolves.toMatchObject({ state: 'committed', result: 'pty-command-test' });
+    expect(terminalCreateHandler).toHaveBeenCalledTimes(1);
+
+    const conflictingArgs = [
+      {
+        cwd: temporaryDirectory,
+        title: 'different',
+        sessionId: 'terminal-durable-command-1',
+        persistent: true,
+      },
+    ];
+    socket.send(
+      JSON.stringify({
+        ...command,
+        requestDigest: digestWorkspaceCommandRequest(
+          command.command,
+          command.commandVersion,
+          conflictingArgs
+        ),
+        args: conflictingArgs,
+      })
+    );
+    await expect(
+      next(
+        (frame) =>
+          frame.t === 'command.result' &&
+          frame.operationId === command.operationId &&
+          (frame.error as { code?: unknown } | undefined)?.code === 'CONFLICT'
+      )
+    ).resolves.toMatchObject({ state: 'failed' });
+    expect(terminalCreateHandler).toHaveBeenCalledTimes(1);
 
     const replayClose = new Promise<number>((resolve) => {
       socket.once('close', (code) => resolve(code));
@@ -225,6 +410,49 @@ describe('Remote Workspace Mirror V2 WebSocket', () => {
       holderClientId: 'managed-client',
       holderDeviceId: 'managed-device',
     });
+    await expect(
+      manager.forward(webContents.id, IPC_CHANNELS.WORKSPACE_MIRROR_RESOLVE_ENTITIES, [
+        [{ kind: 'repository', path: temporaryDirectory }],
+      ])
+    ).resolves.toMatchObject([
+      { status: 'resolved', entityId: 'repo-integration', match: 'current' },
+    ]);
+    const reservedWorktreePath = join(temporaryDirectory, 'reserved-worktree');
+    const reservation = await manager.forward(
+      webContents.id,
+      IPC_CHANNELS.WORKSPACE_MIRROR_REGISTER_ENTITY,
+      ['worktree', reservedWorktreePath]
+    );
+    expect(reservation).toMatchObject({
+      kind: 'worktree',
+      path: reservedWorktreePath,
+      disposition: 'new',
+    });
+    await expect(
+      manager.forward(webContents.id, IPC_CHANNELS.WORKSPACE_MIRROR_RESOLVE_ENTITIES, [
+        [{ kind: 'worktree', path: reservedWorktreePath }],
+      ])
+    ).resolves.toMatchObject([{ status: 'resolved', match: 'reservation', durable: true }]);
+    await expect(
+      manager.forward(webContents.id, IPC_CHANNELS.TERMINAL_CREATE, [
+        { cwd: temporaryDirectory, title: 'managed' },
+      ])
+    ).resolves.toBe('remote:pty-command-test');
+    expect(terminalCreateHandler).toHaveBeenCalledTimes(2);
+    expect(terminalCreateHandler.mock.calls[1]?.[1]).toMatchObject({
+      cwd: temporaryDirectory,
+      title: 'managed',
+      sessionId: expect.stringMatching(/^terminal-[0-9a-f-]{36}$/),
+      persistent: true,
+    });
+    await expect(
+      manager.forward(webContents.id, IPC_CHANNELS.FILE_WATCH_START, [temporaryDirectory])
+    ).resolves.toBeUndefined();
+    await expect(
+      manager.forward(webContents.id, IPC_CHANNELS.FILE_WATCH_STOP, [temporaryDirectory])
+    ).resolves.toBeUndefined();
+    expect(watchStartHandler).toHaveBeenCalledTimes(1);
+    expect(watchStopHandler).toHaveBeenCalledTimes(1);
     const managedResult = await manager.forward(
       webContents.id,
       IPC_CHANNELS.WORKSPACE_MIRROR_DISPATCH_INTENT,

@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { isRemoteHostPathWithinRoot, RemoteClientManager } from '../RemoteClientManager';
+import {
+  isRemoteHostPathWithinRoot,
+  RemoteClientManager,
+  RemoteWorkspaceCommandError,
+  restoreMirrorCommandResult,
+} from '../RemoteClientManager';
 
 describe('remote preview path ownership', () => {
   it('matches host paths with the remote platform semantics', () => {
@@ -8,11 +13,131 @@ describe('remote preview path ownership', () => {
       false
     );
     expect(isRemoteHostPathWithinRoot('C:\\Work\\Repo\\image.png', 'c:\\work\\repo', 'win32')).toBe(
-      true
+      false
     );
     expect(isRemoteHostPathWithinRoot('/Users/Me/Repo/a.png', '/users/me/repo', 'darwin')).toBe(
-      true
+      false
     );
+  });
+
+  it('restores a redacted clone path only from the bound original request', () => {
+    expect(
+      restoreMirrorCommandResult(
+        {
+          t: 'command.execute',
+          operationId: 'clone-1',
+          clientSeq: 1,
+          command: 'git:clone',
+          commandVersion: 1,
+          requestDigest: 'a'.repeat(64),
+          args: ['ssh://example.invalid/repository.git', '/host/repository'],
+        },
+        { success: true }
+      )
+    ).toEqual({ success: true, path: '/host/repository' });
+    expect(
+      restoreMirrorCommandResult(
+        {
+          t: 'command.execute',
+          operationId: 'entity-1',
+          clientSeq: 2,
+          command: 'workspaceMirror:registerEntity',
+          commandVersion: 1,
+          requestDigest: 'b'.repeat(64),
+          args: ['repository', '/host/repository'],
+        },
+        {
+          sceneId: 'scene-1',
+          entityId: 'entity-1',
+          kind: 'repository',
+          disposition: 'new',
+        }
+      )
+    ).toEqual({
+      sceneId: 'scene-1',
+      entityId: 'entity-1',
+      kind: 'repository',
+      disposition: 'new',
+      path: '/host/repository',
+      normalizedPath: '/host/repository',
+    });
+    expect(
+      restoreMirrorCommandResult(
+        {
+          t: 'command.execute',
+          operationId: 'adoption-1',
+          clientSeq: 3,
+          command: 'workspaceMirror:adoptEntity',
+          commandVersion: 1,
+          requestDigest: 'c'.repeat(64),
+          args: ['repository', 'entity-1', '/host/repository-renamed'],
+        },
+        {
+          ok: true,
+          reservation: {
+            sceneId: 'scene-1',
+            entityId: 'entity-1',
+            kind: 'repository',
+            disposition: 'adopted',
+          },
+        }
+      )
+    ).toEqual({
+      ok: true,
+      reservation: {
+        sceneId: 'scene-1',
+        entityId: 'entity-1',
+        kind: 'repository',
+        disposition: 'adopted',
+        path: '/host/repository-renamed',
+        normalizedPath: '/host/repository-renamed',
+      },
+    });
+  });
+
+  it('preserves typed RESULT_EXPIRED failures from command status recovery', () => {
+    const manager = new RemoteClientManager();
+    const reject = vi.fn();
+    const frame = {
+      t: 'command.execute' as const,
+      operationId: 'expired-command',
+      clientSeq: 1,
+      command: 'tempWorkspace:checkPath',
+      commandVersion: 1,
+      requestDigest: 'd'.repeat(64),
+      args: ['/host/repository'],
+    };
+    const connection = {
+      mirrorPendingCommands: new Map([
+        [frame.operationId, { frame, resolve: vi.fn(), reject, timer: null }],
+      ]),
+    } as never;
+    (
+      manager as unknown as {
+        handleMirrorServerFrame: (connection: unknown, frame: unknown) => void;
+      }
+    ).handleMirrorServerFrame(connection, {
+      t: 'command.result',
+      operationId: frame.operationId,
+      command: frame.command,
+      commandVersion: frame.commandVersion,
+      requestDigest: frame.requestDigest,
+      state: 'committed',
+      resultDigest: 'e'.repeat(64),
+      resultExpired: true,
+      error: {
+        code: 'RESULT_EXPIRED',
+        message: 'Workspace command result is no longer available',
+        retryable: false,
+      },
+    });
+
+    expect(reject).toHaveBeenCalledTimes(1);
+    expect(reject.mock.calls[0]?.[0]).toBeInstanceOf(RemoteWorkspaceCommandError);
+    expect(reject.mock.calls[0]?.[0]).toMatchObject({
+      code: 'RESULT_EXPIRED',
+      retryable: false,
+    });
   });
 });
 
@@ -97,6 +222,8 @@ describe('RemoteClientManager V2 terminal attach', () => {
       terminalStreamCursors: new Map(),
       mirrorPendingControls: new Map(),
       mirrorPendingIntents: new Map(),
+      mirrorPendingCommands: new Map(),
+      mirrorPendingCoordination: new Map(),
       mirrorPendingResourceUploads: new Map(),
     } as never;
     const attach = manager as unknown as {

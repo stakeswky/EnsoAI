@@ -5,7 +5,9 @@ import * as os from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import {
   type ClientHelloFrame,
+  decodeWorkspaceCommandArgs,
   IPC_CHANNELS,
+  JsonValueSchema,
   REMOTE_FS_READ_FILE_CHANNEL,
   REMOTE_PROTOCOL_VERSION,
   REMOTE_TOKEN_HEADER,
@@ -19,6 +21,8 @@ import {
   WORKSPACE_MIRROR_SCHEMA_VERSION,
   WORKSPACE_MIRROR_SUBPROTOCOL,
   type WorkspaceMirrorCapability,
+  type WorkspaceMirrorError,
+  type WorkspaceMirrorErrorCode,
   type WorkspaceMirrorScope,
   type WorkspaceMirrorV2Frame,
   type WorkspaceSceneSnapshot,
@@ -30,16 +34,29 @@ import { terminalSessionRegistry } from '../terminal/terminalRuntime';
 import {
   isExistingOrWorkspacePath,
   isPathWithinRoots,
+  remoteRepositoryBasePath,
+  remoteWorktreeBasePath,
   resolveWorkspaceChild,
   workspaceRootPaths,
 } from '../workspace/WorkspacePathPolicy';
 import {
+  getWorkspaceCommandExecutor,
   getWorkspaceMirrorService,
   getWorkspaceResourceService,
 } from '../workspace/workspaceMirrorRuntime';
 import { getRegisteredHandler } from './handlerRegistry';
+import { MirrorFlowController } from './MirrorFlowController';
 import { type RemotePairedDevice, RemotePairedDeviceStore } from './RemotePairedDeviceStore';
+import {
+  type DurableRemoteCommandDescriptor,
+  getRemoteCommandDescriptor,
+  getRemoteV2EventCapability,
+} from './remoteCommandManifest';
 import { parseRemoteFrame } from './remoteFrameCodec';
+import {
+  getRemoteReadOnlyRequestSchema,
+  REMOTE_READ_ONLY_RESULT_SCHEMA,
+} from './remoteReadOnlySchemas';
 import {
   createWorkspaceSnapshotFrames,
   parseWorkspaceMirrorV2Frame,
@@ -58,6 +75,11 @@ const MAX_PAIRING_ATTEMPTS = 5;
 const MAX_ACTIVE_RESOURCE_UPLOADS_PER_CLIENT = 4;
 const RESOURCE_UPLOAD_TTL_MS = 2 * 60 * 1_000;
 const MAX_RESOURCE_UPLOAD_BYTES_PER_CLIENT = 40 * 1024 * 1024;
+const V2_COORDINATION_HANDLER_CHANNELS = new Set<string>([
+  IPC_CHANNELS.FILE_WATCH_START,
+  IPC_CHANNELS.FILE_WATCH_STOP,
+  IPC_CHANNELS.WORKSPACE_MIRROR_MATERIALIZE_RESOURCE,
+]);
 
 export function workspaceSceneHasVolatileData(snapshot: WorkspaceSceneSnapshot): boolean {
   const hasDirtyBuffer = Object.values(snapshot.editors).some((editor) =>
@@ -71,66 +93,6 @@ export function workspaceSceneHasVolatileData(snapshot: WorkspaceSceneSnapshot):
   );
   return hasDirtyBuffer || hasAgentDraft;
 }
-const V2_READ_ONLY_RPC_CHANNELS = new Set<string>([
-  IPC_CHANNELS.GIT_STATUS,
-  IPC_CHANNELS.GIT_BRANCH_LIST,
-  IPC_CHANNELS.GIT_BRANCH_HEAD_INFO,
-  IPC_CHANNELS.GIT_LOG,
-  IPC_CHANNELS.GIT_DIFF,
-  IPC_CHANNELS.GIT_FILE_CHANGES,
-  IPC_CHANNELS.GIT_FILE_DIFF,
-  IPC_CHANNELS.GIT_COMMIT_SHOW,
-  IPC_CHANNELS.GIT_COMMIT_FILES,
-  IPC_CHANNELS.GIT_COMMIT_DIFF,
-  IPC_CHANNELS.GIT_DIFF_STATS,
-  IPC_CHANNELS.GIT_GH_STATUS,
-  IPC_CHANNELS.GIT_PR_LIST,
-  IPC_CHANNELS.GIT_VALIDATE_URL,
-  IPC_CHANNELS.GIT_BLAME,
-  IPC_CHANNELS.GIT_SUBMODULE_LIST,
-  IPC_CHANNELS.GIT_SUBMODULE_CHANGES,
-  IPC_CHANNELS.GIT_SUBMODULE_FILE_DIFF,
-  IPC_CHANNELS.GIT_SUBMODULE_BRANCHES,
-  IPC_CHANNELS.GIT_VALIDATE_LOCAL_PATH,
-  IPC_CHANNELS.WORKTREE_LIST,
-  IPC_CHANNELS.WORKTREE_MERGE_STATE,
-  IPC_CHANNELS.WORKTREE_MERGE_CONFLICTS,
-  IPC_CHANNELS.WORKTREE_MERGE_CONFLICT_CONTENT,
-  IPC_CHANNELS.TERMINAL_LIST_PERSISTENT,
-  IPC_CHANNELS.TERMINAL_GET_ACTIVITY,
-  IPC_CHANNELS.FILE_READ,
-  IPC_CHANNELS.FILE_LIST,
-  IPC_CHANNELS.FILE_EXISTS,
-  IPC_CHANNELS.FILE_CHECK_CONFLICTS,
-  IPC_CHANNELS.FILE_WATCH_START,
-  IPC_CHANNELS.FILE_WATCH_STOP,
-  IPC_CHANNELS.SHELL_DETECT,
-  IPC_CHANNELS.SHELL_RESOLVE_FOR_COMMAND,
-  IPC_CHANNELS.SEARCH_FILES,
-  IPC_CHANNELS.SEARCH_CONTENT,
-  IPC_CHANNELS.AGENT_LIST,
-  IPC_CHANNELS.TODO_GET_TASKS,
-  IPC_CHANNELS.TMUX_CHECK,
-  IPC_CHANNELS.WORKSPACE_MIRROR_MATERIALIZE_RESOURCE,
-  IPC_CHANNELS.WORKSPACE_MIRROR_FETCH_RESOURCE,
-  REMOTE_FS_READ_FILE_CHANNEL,
-]);
-const V2_RPC_CAPABILITY_BY_CHANNEL = new Map<string, WorkspaceMirrorCapability>([
-  [IPC_CHANNELS.TERMINAL_CREATE, 'terminal.stream'],
-  [IPC_CHANNELS.TERMINAL_WRITE, 'terminal.stream'],
-  [IPC_CHANNELS.TERMINAL_RESIZE, 'terminal.stream'],
-  [IPC_CHANNELS.TERMINAL_DESTROY, 'terminal.stream'],
-  [IPC_CHANNELS.TERMINAL_ATTACH, 'terminal.stream'],
-  [IPC_CHANNELS.TERMINAL_DETACH, 'terminal.stream'],
-  [IPC_CHANNELS.TERMINAL_LIST_PERSISTENT, 'terminal.stream'],
-  [IPC_CHANNELS.TERMINAL_GET_ACTIVITY, 'terminal.stream'],
-  [IPC_CHANNELS.WORKSPACE_MIRROR_STAGE_RESOURCE, 'resource.transfer'],
-  [IPC_CHANNELS.WORKSPACE_MIRROR_MATERIALIZE_RESOURCE, 'resource.transfer'],
-  [IPC_CHANNELS.WORKSPACE_MIRROR_FETCH_RESOURCE, 'resource.transfer'],
-]);
-
-const V2_LEGACY_TERMINAL_RPC_CHANNELS = new Set<string>([IPC_CHANNELS.TERMINAL_ATTACH]);
-
 const V2_WORKSPACE_ROOT_CHANNELS = new Set<string>([
   IPC_CHANNELS.GIT_STATUS,
   IPC_CHANNELS.GIT_BRANCH_LIST,
@@ -210,11 +172,25 @@ function isPathValue(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function isSafeGitObjectId(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{4,64}$/i.test(value);
+}
+
+function isSafeGitRevision(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 1_024 &&
+    !value.startsWith('-') &&
+    !/[\0-\x20\x7f]/.test(value) &&
+    !value.includes('..') &&
+    !value.includes('@{') &&
+    !value.endsWith('.')
+  );
+}
+
 function normalizePathForComparison(value: string): string {
-  const normalized = resolve(value).replace(/[\\/]+$/, '');
-  return process.platform === 'win32' || process.platform === 'darwin'
-    ? normalized.toLowerCase()
-    : normalized;
+  return resolve(value).replace(/[\\/]+$/, '');
 }
 
 function pathsEqual(left: string, right: string): boolean {
@@ -304,14 +280,6 @@ function defaultRemoteTempBase(): string {
   return join(os.homedir(), 'ensoai', 'temporary');
 }
 
-function defaultRemoteRepositoryBase(): string {
-  return join(os.homedir(), 'ensoai', 'repos');
-}
-
-function defaultRemoteWorktreeBase(): string {
-  return join(os.homedir(), 'ensoai', 'workspaces');
-}
-
 async function isAuthorizedNewWorkspacePath(
   value: unknown,
   configuredRoot: string
@@ -325,8 +293,8 @@ async function isAuthorizedWorkspaceBrowsePath(
 ): Promise<boolean> {
   return (
     (await isWorkspacePath(value, roots)) ||
-    (await isAuthorizedNewWorkspacePath(value, defaultRemoteRepositoryBase())) ||
-    (await isAuthorizedNewWorkspacePath(value, defaultRemoteWorktreeBase()))
+    (await isAuthorizedNewWorkspacePath(value, remoteRepositoryBasePath())) ||
+    (await isAuthorizedNewWorkspacePath(value, remoteWorktreeBasePath()))
   );
 }
 
@@ -452,7 +420,7 @@ export async function validateV2WorkspaceRpcPaths(
     return (
       (await isWorkspaceWritePath(args[1], roots)) ||
       (await isNewSiblingOfAnyWorkspace(args[1], roots)) ||
-      (await isAuthorizedNewWorkspacePath(args[1], defaultRemoteRepositoryBase()))
+      (await isAuthorizedNewWorkspacePath(args[1], remoteRepositoryBasePath()))
     );
   }
   if (channel === IPC_CHANNELS.TEMP_WORKSPACE_CHECK_PATH) {
@@ -463,6 +431,31 @@ export async function validateV2WorkspaceRpcPaths(
   }
   if (channel === IPC_CHANNELS.TEMP_WORKSPACE_REMOVE) {
     return isAuthorizedTempChild(args[0], args[1], roots);
+  }
+  if (channel === IPC_CHANNELS.WORKSPACE_MIRROR_RESOLVE_ENTITIES) {
+    const requests = args[0];
+    if (!Array.isArray(requests) || requests.length > 10_000) return false;
+    for (const request of requests) {
+      if (
+        !request ||
+        typeof request !== 'object' ||
+        !['repository', 'worktree'].includes(String((request as { kind?: unknown }).kind)) ||
+        !(await isAuthorizedWorkspaceBrowsePath((request as { path?: unknown }).path, roots))
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (
+    channel === IPC_CHANNELS.WORKSPACE_MIRROR_REGISTER_ENTITY ||
+    channel === IPC_CHANNELS.WORKSPACE_MIRROR_ADOPT_ENTITY
+  ) {
+    const pathIndex = channel === IPC_CHANNELS.WORKSPACE_MIRROR_ADOPT_ENTITY ? 2 : 1;
+    return (
+      ['repository', 'worktree'].includes(String(args[0])) &&
+      (await isAuthorizedWorkspaceBrowsePath(args[pathIndex], roots))
+    );
   }
   if (channel === IPC_CHANNELS.TERMINAL_CREATE) {
     const options = args[0];
@@ -508,17 +501,30 @@ export async function validateV2WorkspaceRpcPaths(
   if (!(await isWorkspacePath(args[0], roots))) return false;
   switch (channel) {
     case IPC_CHANNELS.GIT_LOG:
-      return isWorkspaceChild(args[0], args[3], roots);
+      return (
+        (args[1] === undefined ||
+          (Number.isSafeInteger(args[1]) && Number(args[1]) >= 0 && Number(args[1]) <= 1_000)) &&
+        (args[2] === undefined || (Number.isSafeInteger(args[2]) && Number(args[2]) >= 0)) &&
+        (await isWorkspaceChild(args[0], args[3], roots))
+      );
+    case IPC_CHANNELS.GIT_BRANCH_HEAD_INFO:
+      return isSafeGitRevision(args[1]);
+    case IPC_CHANNELS.GIT_COMMIT_SHOW:
+      return isSafeGitObjectId(args[1]);
     case IPC_CHANNELS.GIT_COMMIT_FILES:
-      return isWorkspaceChild(args[0], args[2], roots);
+      return isSafeGitObjectId(args[1]) && isWorkspaceChild(args[0], args[2], roots);
     case IPC_CHANNELS.GIT_FILE_DIFF:
     case IPC_CHANNELS.GIT_BLAME:
       return isWorkspaceChild(args[0], args[1], roots);
-    case IPC_CHANNELS.GIT_COMMIT_DIFF:
+    case IPC_CHANNELS.GIT_COMMIT_DIFF: {
+      if (!isSafeGitObjectId(args[1])) return false;
+      const submoduleRoot = resolveWorkspaceChild(args[0] as string, String(args[4] ?? ''));
       return (
-        (await isWorkspaceChild(args[0], args[3], roots)) &&
-        isWorkspaceChild(args[0], args[4], roots)
+        submoduleRoot !== null &&
+        (await isExistingOrWorkspacePath(submoduleRoot, roots)) &&
+        isWorkspaceChild(submoduleRoot, args[2], roots)
       );
+    }
     case IPC_CHANNELS.GIT_SUBMODULE_FILE_DIFF: {
       const submoduleRoot = resolveWorkspaceChild(args[0] as string, String(args[1] ?? ''));
       return (
@@ -529,7 +535,11 @@ export async function validateV2WorkspaceRpcPaths(
     }
     case IPC_CHANNELS.GIT_SUBMODULE_INIT:
     case IPC_CHANNELS.GIT_SUBMODULE_UPDATE:
+      return args[1] === undefined || typeof args[1] === 'boolean';
     case IPC_CHANNELS.GIT_SUBMODULE_SYNC:
+      return args[1] === undefined;
+    case IPC_CHANNELS.GIT_SUBMODULE_CHANGES:
+    case IPC_CHANNELS.GIT_SUBMODULE_BRANCHES:
     case IPC_CHANNELS.GIT_SUBMODULE_FETCH:
     case IPC_CHANNELS.GIT_SUBMODULE_PULL:
     case IPC_CHANNELS.GIT_SUBMODULE_PUSH:
@@ -546,7 +556,7 @@ export async function validateV2WorkspaceRpcPaths(
       return (
         (await isWorkspaceWritePath(target, roots)) ||
         (await isNewWorkspaceSibling(args[0], target, roots)) ||
-        (await isAuthorizedNewWorkspacePath(target, defaultRemoteWorktreeBase()))
+        (await isAuthorizedNewWorkspacePath(target, remoteWorktreeBasePath()))
       );
     }
     case IPC_CHANNELS.WORKTREE_REMOVE: {
@@ -612,6 +622,7 @@ interface ClientConnection {
   alive: boolean;
   destroyedCallbacks: Array<() => void>;
   activeRequestIds: Set<number>;
+  activeCoordRequestIds: Set<string>;
   requestWindowStartedAt: number;
   requestCount: number;
   protocol: 'v1' | 'v2';
@@ -646,6 +657,15 @@ interface MirrorUploadState {
   receivedBytes: number;
   nextIndex: number;
   startedAt: number;
+}
+
+function canSendRemoteEvent(conn: ClientConnection, channel: string): boolean {
+  if (conn.protocol === 'v1') return true;
+  const capability = getRemoteV2EventCapability(channel);
+  return (
+    capability !== undefined &&
+    (capability === null || conn.mirrorClient?.capabilities.includes(capability) === true)
+  );
 }
 
 /** Detect a Tailscale IPv4 address (CGNAT range 100.64.0.0/10) */
@@ -687,7 +707,7 @@ function createVirtualSender(conn: ClientConnection): WebContents {
   const virtualSender = {
     id: conn.senderId,
     send: (channel: string, ...args: unknown[]): void => {
-      if (conn.ws.readyState === conn.ws.OPEN) {
+      if (canSendRemoteEvent(conn, channel) && conn.ws.readyState === conn.ws.OPEN) {
         conn.ws.send(JSON.stringify({ t: 'ev', ch: channel, payload: args }));
       }
     },
@@ -723,6 +743,7 @@ export class RemoteHostServer {
   private deviceStore: RemotePairedDeviceStore | null;
   private pairingExpiresAt = 0;
   private pairingAttempts = 0;
+  private flowController = new MirrorFlowController();
 
   constructor(deviceStore?: RemotePairedDeviceStore) {
     this.deviceStore = deviceStore ?? null;
@@ -892,6 +913,7 @@ export class RemoteHostServer {
     const frame = JSON.stringify({ t: 'ev', ch: channel, payload: args });
     for (const conn of this.clients) {
       if (channel.startsWith('workspaceMirror:')) continue;
+      if (!canSendRemoteEvent(conn, channel)) continue;
       if (
         conn.protocol === 'v2' &&
         (!conn.mirrorAuthenticated ||
@@ -953,8 +975,12 @@ export class RemoteHostServer {
     return true;
   }
 
-  setMirrorV2Enabled(enabled: boolean): void {
-    if (!enabled && workspaceSceneHasVolatileData(getWorkspaceMirrorService().getSnapshot())) {
+  setMirrorV2Enabled(enabled: boolean, options?: { skipVolatileGuard?: boolean }): void {
+    if (
+      !enabled &&
+      !options?.skipVolatileGuard &&
+      workspaceSceneHasVolatileData(getWorkspaceMirrorService().getSnapshot())
+    ) {
       throw new Error(
         'Live Mirror cannot be disabled while dirty editor buffers or Agent drafts require handoff'
       );
@@ -988,7 +1014,14 @@ export class RemoteHostServer {
     // otherwise a read-only paired device could reconnect without a
     // subprotocol and bypass all V2 authorization checks.
     if (ws.protocol !== WORKSPACE_MIRROR_SUBPROTOCOL && this.config?.mirrorV2Enabled === true) {
-      ws.close(4406, 'legacy remote transport is disabled while mirror V2 is enabled');
+      ws.send(
+        JSON.stringify({
+          t: 'protocol.error',
+          code: 'UPGRADE_REQUIRED',
+          message: 'Legacy remote transport is disabled while workspace mirror V2 is enabled',
+        }),
+        () => ws.close(4406, 'workspace mirror V2 upgrade required')
+      );
       return;
     }
     const token = this.config?.token;
@@ -1004,6 +1037,7 @@ export class RemoteHostServer {
       alive: true,
       destroyedCallbacks: [],
       activeRequestIds: new Set(),
+      activeCoordRequestIds: new Set(),
       requestWindowStartedAt: Date.now(),
       requestCount: 0,
       protocol: ws.protocol === WORKSPACE_MIRROR_SUBPROTOCOL ? 'v2' : 'v1',
@@ -1087,14 +1121,14 @@ export class RemoteHostServer {
 
   private sendMirrorError(
     conn: ClientConnection,
-    code: 'INVALID_FRAME' | 'UNAUTHORIZED' | 'FORBIDDEN' | 'CONFLICT' | 'INTERNAL',
+    code: WorkspaceMirrorErrorCode,
     message: string,
     requestId?: string
   ): void {
     this.sendMirrorFrame(conn, {
       t: 'error',
       ...(requestId ? { requestId } : {}),
-      error: { code, message, retryable: code === 'INTERNAL' },
+      error: { code, message, retryable: code === 'INTERNAL' || code === 'RATE_LIMITED' },
     });
   }
 
@@ -1113,6 +1147,7 @@ export class RemoteHostServer {
         'scene.snapshot',
         'scene.replay',
         'scene.intent',
+        'command.execute',
         'control.lease',
         'terminal.stream',
         'agent.stream',
@@ -1226,6 +1261,178 @@ export class RemoteHostServer {
     }
     if (!service.isBootstrapReady()) {
       this.sendMirrorError(conn, 'INTERNAL', 'workspace mirror is bootstrapping');
+      return;
+    }
+
+    if (frame.t === 'command.execute') {
+      const descriptor = getRemoteCommandDescriptor(frame.command);
+      if (descriptor?.route !== 'durable-command') {
+        this.sendMirrorError(
+          conn,
+          descriptor?.route === 'v2-forbidden' ? 'FORBIDDEN' : 'UPGRADE_REQUIRED',
+          'Workspace command is not available on the durable command plane',
+          frame.operationId
+        );
+        return;
+      }
+      if (
+        !client.capabilities.includes('command.execute') ||
+        (descriptor.requiredCapability !== null &&
+          !client.capabilities.includes(descriptor.requiredCapability))
+      ) {
+        this.sendMirrorError(
+          conn,
+          'FORBIDDEN',
+          'Workspace command capability was not negotiated',
+          frame.operationId
+        );
+        return;
+      }
+      if (
+        !(await validateV2WorkspaceRpcPaths(
+          frame.command,
+          frame.args,
+          workspaceRootPaths(service.getSnapshot())
+        ))
+      ) {
+        this.sendMirrorError(
+          conn,
+          'FORBIDDEN',
+          'Workspace command path is not authorized',
+          frame.operationId
+        );
+        return;
+      }
+      const result = await getWorkspaceCommandExecutor().execute({
+        frame,
+        actor: { clientId: client.clientId, deviceId: client.deviceId },
+        authorize: () => this.workspaceCommandAuthorizationError(conn, descriptor),
+        invoke: async (command, args) => {
+          const handler = getRegisteredHandler(command);
+          if (!handler) throw new Error('Workspace command handler is unavailable');
+          return handler(virtualEvent, ...args);
+        },
+      });
+      this.sendMirrorFrame(conn, result);
+      return;
+    }
+
+    if (frame.t === 'command.status') {
+      if (!this.authorizeMirrorAction(conn, 'mirror.read', 'command.execute', frame.requestId)) {
+        return;
+      }
+      const status = await getWorkspaceCommandExecutor().status(
+        frame.operationId,
+        { clientId: client.clientId, deviceId: client.deviceId },
+        frame.requestId
+      );
+      if ('error' in status) {
+        this.sendMirrorError(conn, status.error.code, status.error.message, frame.requestId);
+      } else {
+        this.sendMirrorFrame(conn, status.result);
+      }
+      return;
+    }
+
+    if (frame.t === 'coord.command') {
+      const descriptor = getRemoteCommandDescriptor(frame.command);
+      if (
+        descriptor?.route !== 'stream/coordination' ||
+        !V2_COORDINATION_HANDLER_CHANNELS.has(frame.command)
+      ) {
+        this.sendMirrorError(
+          conn,
+          'FORBIDDEN',
+          'Workspace coordination command is not available',
+          frame.requestId
+        );
+        return;
+      }
+      if (
+        !this.hasCurrentDeviceScope(conn, descriptor.requiredScope) ||
+        (descriptor.requiredCapability !== null &&
+          !client.capabilities.includes(descriptor.requiredCapability))
+      ) {
+        this.sendMirrorError(
+          conn,
+          'FORBIDDEN',
+          'Workspace coordination capability is required',
+          frame.requestId
+        );
+        return;
+      }
+      if (descriptor.requiresController && !(await this.hasActiveMirrorControl(conn))) {
+        this.sendMirrorError(
+          conn,
+          'LEASE_REQUIRED',
+          'Workspace control is required',
+          frame.requestId
+        );
+        return;
+      }
+      if (
+        conn.activeCoordRequestIds.size >= MAX_CONCURRENT_REQUESTS ||
+        conn.activeCoordRequestIds.has(frame.requestId)
+      ) {
+        this.sendMirrorError(
+          conn,
+          'RATE_LIMITED',
+          'Too many workspace coordination requests',
+          frame.requestId
+        );
+        return;
+      }
+      if (
+        !(await validateV2WorkspaceRpcPaths(
+          frame.command,
+          frame.args,
+          workspaceRootPaths(service.getSnapshot())
+        ))
+      ) {
+        this.sendMirrorError(
+          conn,
+          'FORBIDDEN',
+          'Workspace coordination path is not authorized',
+          frame.requestId
+        );
+        return;
+      }
+      const handler = getRegisteredHandler(frame.command);
+      if (!handler) {
+        this.sendMirrorError(
+          conn,
+          'INTERNAL',
+          'Workspace coordination handler is unavailable',
+          frame.requestId
+        );
+        return;
+      }
+      conn.activeCoordRequestIds.add(frame.requestId);
+      try {
+        const result = await handler(virtualEvent, ...decodeWorkspaceCommandArgs(frame.args));
+        const parsedResult = result === undefined ? undefined : JsonValueSchema.parse(result);
+        this.sendMirrorFrame(conn, {
+          t: 'coord.commandResult',
+          requestId: frame.requestId,
+          command: frame.command,
+          ok: true,
+          ...(parsedResult === undefined ? {} : { result: parsedResult }),
+        });
+      } catch {
+        this.sendMirrorFrame(conn, {
+          t: 'coord.commandResult',
+          requestId: frame.requestId,
+          command: frame.command,
+          ok: false,
+          error: {
+            code: 'INTERNAL',
+            message: 'Workspace coordination command failed',
+            retryable: true,
+          },
+        });
+      } finally {
+        conn.activeCoordRequestIds.delete(frame.requestId);
+      }
       return;
     }
 
@@ -1351,6 +1558,24 @@ export class RemoteHostServer {
 
     if (frame.t === 'stream.detach') {
       this.detachMirrorStream(conn, frame.streamId);
+      return;
+    }
+
+    if (frame.t === 'stream.ack') {
+      const connectionKey = String(conn.senderId);
+      const ackResult = this.flowController.applyAck(connectionKey, {
+        streamId: frame.streamId,
+        streamKind: frame.streamKind,
+        entityId: frame.entityId,
+        entityGeneration: frame.entityGeneration,
+        consumedStreamSeq: frame.consumedStreamSeq,
+        creditBytes: frame.creditBytes,
+      });
+      if (!ackResult.ok) {
+        this.sendMirrorError(conn, 'INVALID_FRAME', ackResult.reason);
+        return;
+      }
+      this.flushConnectionStreams(conn);
       return;
     }
 
@@ -1660,6 +1885,23 @@ export class RemoteHostServer {
     };
     conn.mirrorStreams.set(frame.streamId, attachment);
     try {
+      const connectionKey = String(conn.senderId);
+      const flowAttach = this.flowController.attach(connectionKey, {
+        streamId: frame.streamId,
+        streamKind: frame.streamKind,
+        entityId: frame.entityId,
+        entityGeneration: frame.entityGeneration,
+      });
+      if (!flowAttach.ok) {
+        conn.mirrorStreams.delete(frame.streamId);
+        this.sendMirrorError(
+          conn,
+          'RATE_LIMITED',
+          'stream attachment limit reached',
+          frame.streamId
+        );
+        return;
+      }
       const result = terminalSessionRegistry.attach(terminalSessionId, {
         subscriberId,
         afterStreamSeq: frame.fromStreamSeq,
@@ -1677,6 +1919,7 @@ export class RemoteHostServer {
         currentStreamSeq: result.currentStreamSeq,
         replayedEventCount: result.replayedEventCount,
       });
+      this.flushConnectionStreams(conn);
     } catch {
       conn.mirrorStreams.delete(frame.streamId);
       terminalSessionRegistry.detach(terminalSessionId, subscriberId);
@@ -1698,14 +1941,40 @@ export class RemoteHostServer {
       entityGeneration: attachment.entityGeneration,
     } as const;
     if (event.type === 'stream.data') {
-      this.sendMirrorFrame(conn, {
-        t: 'stream.chunk',
-        ...identity,
-        sceneRevision,
+      const connectionKey = String(conn.senderId);
+      const decision = this.flowController.enqueueChunk(connectionKey, {
+        streamId: attachment.streamId,
+        streamKind: attachment.streamKind,
+        entityId: attachment.entityId,
+        entityGeneration: attachment.entityGeneration,
         streamSeq: event.streamSeq,
         encoding: 'utf8',
         data: event.data,
+        sceneRevision,
       });
+      if (decision.action === 'reset') {
+        this.sendMirrorFrame(conn, {
+          t: 'stream.reset',
+          ...identity,
+          reason: 'backpressure-overflow',
+          nextStreamSeq: decision.nextStreamSeq,
+          sceneRevision,
+        });
+        this.detachMirrorStream(conn, attachment.streamId);
+        return;
+      }
+      if (decision.action === 'send') {
+        this.sendMirrorFrame(conn, {
+          t: 'stream.chunk',
+          ...identity,
+          sceneRevision,
+          streamSeq: decision.chunk.streamSeq,
+          encoding: decision.chunk.encoding,
+          data: decision.chunk.data,
+        });
+        return;
+      }
+      this.flushConnectionStreams(conn);
       return;
     }
     if (event.type === 'stream.reset') {
@@ -1727,6 +1996,25 @@ export class RemoteHostServer {
     });
   }
 
+  private flushConnectionStreams(conn: ClientConnection): void {
+    const connectionKey = String(conn.senderId);
+    const chunks = this.flowController.flush(connectionKey);
+    const sceneRevision = getWorkspaceMirrorService().getSnapshot().revision;
+    for (const chunk of chunks) {
+      this.sendMirrorFrame(conn, {
+        t: 'stream.chunk',
+        streamId: chunk.streamId,
+        streamKind: chunk.streamKind,
+        entityId: chunk.entityId,
+        entityGeneration: chunk.entityGeneration,
+        sceneRevision,
+        streamSeq: chunk.streamSeq,
+        encoding: chunk.encoding,
+        data: chunk.data,
+      });
+    }
+  }
+
   private matchesStreamAttachment(
     attachment: MirrorStreamAttachment,
     frame: Extract<WorkspaceMirrorV2Frame, { t: 'stream.input' | 'stream.resize' }>
@@ -1743,6 +2031,13 @@ export class RemoteHostServer {
     if (!attachment) return;
     conn.mirrorStreams.delete(streamId);
     terminalSessionRegistry.detach(attachment.terminalSessionId, attachment.subscriberId);
+    const connectionKey = String(conn.senderId);
+    this.flowController.detach(connectionKey, {
+      streamId: attachment.streamId,
+      streamKind: attachment.streamKind,
+      entityId: attachment.entityId,
+      entityGeneration: attachment.entityGeneration,
+    });
   }
 
   private rememberStreamOperation(deviceId: string, operationId: string): boolean {
@@ -1774,6 +2069,7 @@ export class RemoteHostServer {
     virtualEvent: IpcMainInvokeEvent,
     frame: RemoteReqFrame
   ): Promise<void> {
+    let dispatchArgs = frame.args;
     const reply = (ok: boolean, result?: unknown, error?: string): void => {
       if (conn.ws.readyState === conn.ws.OPEN) {
         const payload = JSON.stringify({ t: 'res', id: frame.id, ok, result, error });
@@ -1828,29 +2124,54 @@ export class RemoteHostServer {
         reply(false, undefined, 'device authentication is required');
         return;
       }
+      const descriptor = getRemoteCommandDescriptor(frame.ch);
+      if (!descriptor) {
+        reply(false, undefined, `no remote command descriptor for channel: ${frame.ch}`);
+        return;
+      }
+      if (descriptor.route === 'durable-command') {
+        reply(false, undefined, 'use command.execute for durable workspace commands');
+        return;
+      }
+      if (descriptor.route === 'stream/coordination') {
+        reply(false, undefined, 'use the authenticated workspace coordination plane');
+        return;
+      }
+      if (descriptor.route === 'v2-forbidden') {
+        reply(false, undefined, 'channel is not available in workspace mirror V2');
+        return;
+      }
+      if (!this.hasCurrentDeviceScope(conn, descriptor.requiredScope)) {
+        reply(false, undefined, `${descriptor.requiredScope} scope is required`);
+        return;
+      }
       if (
-        frame.ch === IPC_CHANNELS.WORKSPACE_MIRROR_GET_SNAPSHOT ||
-        frame.ch === IPC_CHANNELS.WORKSPACE_MIRROR_DISPATCH_INTENT ||
-        frame.ch === IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL ||
-        frame.ch === IPC_CHANNELS.WORKSPACE_MIRROR_RELEASE_CONTROL ||
-        frame.ch === IPC_CHANNELS.WORKSPACE_MIRROR_COMPLETE_LEGACY_IMPORT
+        descriptor.requiredCapability !== null &&
+        !conn.mirrorClient.capabilities.includes(descriptor.requiredCapability)
       ) {
-        reply(false, undefined, `no compatibility RPC for channel: ${frame.ch}`);
+        reply(false, undefined, `${descriptor.requiredCapability} capability was not negotiated`);
         return;
       }
-      const requiredCapability = V2_RPC_CAPABILITY_BY_CHANNEL.get(frame.ch);
-      if (requiredCapability && !conn.mirrorClient?.capabilities.includes(requiredCapability)) {
-        reply(false, undefined, `${requiredCapability} capability was not negotiated`);
+      const wireArgs = JsonValueSchema.array().safeParse(frame.args);
+      if (!wireArgs.success) {
+        reply(false, undefined, 'remote request arguments are invalid');
         return;
       }
-      if (V2_LEGACY_TERMINAL_RPC_CHANNELS.has(frame.ch)) {
-        reply(false, undefined, 'use the authenticated workspace terminal stream');
+      const requestSchema = getRemoteReadOnlyRequestSchema(frame.ch);
+      if (!requestSchema) {
+        reply(false, undefined, `read-only request schema is missing for channel: ${frame.ch}`);
         return;
       }
+      const parsedArgs = requestSchema.safeParse(decodeWorkspaceCommandArgs(wireArgs.data));
+      if (!parsedArgs.success) {
+        reply(false, undefined, 'remote request arguments are invalid');
+        return;
+      }
+      dispatchArgs = parsedArgs.data;
       if (
         !(await validateV2WorkspaceRpcPaths(
           frame.ch,
-          frame.args,
+          dispatchArgs,
           workspaceRootPaths(getWorkspaceMirrorService().getSnapshot())
         ))
       ) {
@@ -1864,26 +2185,20 @@ export class RemoteHostServer {
       reply(false, undefined, `no handler for channel: ${frame.ch}`);
       return;
     }
-    if (conn.protocol === 'v2' && !V2_READ_ONLY_RPC_CHANNELS.has(frame.ch)) {
-      const client = conn.mirrorClient;
-      const lease = await getWorkspaceMirrorService().getControllerLease();
-      if (
-        !client ||
-        !this.hasCurrentDeviceScope(conn, 'mirror.control') ||
-        !lease ||
-        lease.holderClientId !== client.clientId ||
-        lease.holderDeviceId !== client.deviceId ||
-        lease.graceUntil !== null
-      ) {
-        reply(false, undefined, 'workspace control is required');
-        return;
-      }
-    }
-
     conn.activeRequestIds.add(frame.id);
     try {
-      const result = await handler(virtualEvent, ...frame.args);
-      reply(true, result);
+      const result = await handler(virtualEvent, ...dispatchArgs);
+      if (conn.protocol === 'v2') {
+        const wireResult = result === undefined ? undefined : JSON.parse(JSON.stringify(result));
+        const parsedResult = REMOTE_READ_ONLY_RESULT_SCHEMA.safeParse(wireResult);
+        if (!parsedResult.success) {
+          reply(false, undefined, 'remote response failed schema validation');
+          return;
+        }
+        reply(true, parsedResult.data);
+      } else {
+        reply(true, result);
+      }
     } catch (err) {
       // V2 compatibility RPCs may execute filesystem/git handlers whose
       // native errors contain absolute paths, command output, or credentials.
@@ -1929,6 +2244,8 @@ export class RemoteHostServer {
     for (const streamId of [...conn.mirrorStreams.keys()]) {
       this.detachMirrorStream(conn, streamId);
     }
+    const connectionKey = String(conn.senderId);
+    this.flowController.dropConnection(connectionKey);
     conn.mirrorUploads.clear();
     const callbacks = conn.destroyedCallbacks;
     conn.destroyedCallbacks = [];
@@ -1975,6 +2292,38 @@ export class RemoteHostServer {
       return false;
     }
     return true;
+  }
+
+  private async workspaceCommandAuthorizationError(
+    conn: ClientConnection,
+    descriptor: DurableRemoteCommandDescriptor
+  ): Promise<WorkspaceMirrorError | null> {
+    if (!this.hasCurrentDeviceScope(conn, descriptor.requiredScope)) {
+      return {
+        code: 'FORBIDDEN',
+        message: `${descriptor.requiredScope} scope is required`,
+        retryable: false,
+      };
+    }
+    if (
+      !conn.mirrorClient?.capabilities.includes('command.execute') ||
+      (descriptor.requiredCapability !== null &&
+        !conn.mirrorClient.capabilities.includes(descriptor.requiredCapability))
+    ) {
+      return {
+        code: 'FORBIDDEN',
+        message: 'Workspace command capability was not negotiated',
+        retryable: false,
+      };
+    }
+    if (!(await this.hasActiveMirrorControl(conn))) {
+      return {
+        code: 'LEASE_REQUIRED',
+        message: 'Workspace control is required',
+        retryable: true,
+      };
+    }
+    return null;
   }
 
   private async hasActiveMirrorControl(conn: ClientConnection): Promise<boolean> {

@@ -1,4 +1,5 @@
 import { IPC_CHANNELS, REMOTE_FS_READ_FILE_CHANNEL } from '../../../shared/types';
+import { getRemoteCommandDescriptor } from './remoteCommandManifest';
 
 /**
  * V1 commands that a remote host is allowed to dispatch.
@@ -132,6 +133,9 @@ export const V1_REMOTE_COMMAND_CHANNELS = [
   IPC_CHANNELS.WORKSPACE_MIRROR_DISPATCH_INTENT,
   IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL,
   IPC_CHANNELS.WORKSPACE_MIRROR_RELEASE_CONTROL,
+  IPC_CHANNELS.WORKSPACE_MIRROR_RESOLVE_ENTITIES,
+  IPC_CHANNELS.WORKSPACE_MIRROR_REGISTER_ENTITY,
+  IPC_CHANNELS.WORKSPACE_MIRROR_ADOPT_ENTITY,
   IPC_CHANNELS.WORKSPACE_MIRROR_STAGE_RESOURCE,
   IPC_CHANNELS.WORKSPACE_MIRROR_MATERIALIZE_RESOURCE,
   IPC_CHANNELS.WORKSPACE_MIRROR_FETCH_RESOURCE,
@@ -143,6 +147,13 @@ const v1RemoteCommandSet: ReadonlySet<string> = new Set(V1_REMOTE_COMMAND_CHANNE
 
 export function isV1RemoteCommandChannel(channel: string): channel is V1RemoteCommandChannel {
   return v1RemoteCommandSet.has(channel);
+}
+
+/** A V1 channel is dispatchable only after its V2 migration route is classified. */
+export function isClassifiedRemoteCommandChannel(
+  channel: string
+): channel is V1RemoteCommandChannel {
+  return isV1RemoteCommandChannel(channel) && getRemoteCommandDescriptor(channel) !== undefined;
 }
 
 export interface RemoteCommandRegistry<Handler> {
@@ -159,7 +170,7 @@ export interface RemoteCommandRegistry<Handler> {
  * without importing Electron or constructing an IPC event.
  */
 export function createRemoteCommandRegistry<Handler>(
-  isAllowed: (channel: string) => boolean = isV1RemoteCommandChannel
+  isAllowed: (channel: string) => boolean = isClassifiedRemoteCommandChannel
 ): RemoteCommandRegistry<Handler> {
   const handlers = new Map<string, Handler>();
 

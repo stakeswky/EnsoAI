@@ -59,7 +59,21 @@ const helloSchema = z
   })
   .strict();
 
-const frameSchema = z.discriminatedUnion('t', [reqSchema, resSchema, evSchema, helloSchema]);
+const protocolErrorSchema = z
+  .object({
+    t: z.literal('protocol.error'),
+    code: z.literal('UPGRADE_REQUIRED'),
+    message: z.string().min(1).max(4096),
+  })
+  .strict();
+
+const frameSchema = z.discriminatedUnion('t', [
+  reqSchema,
+  resSchema,
+  evSchema,
+  helloSchema,
+  protocolErrorSchema,
+]);
 
 export class RemoteProtocolError extends Error {
   readonly code = 'REMOTE_PROTOCOL_INVALID';
