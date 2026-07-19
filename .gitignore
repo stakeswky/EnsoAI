@@ -35,3 +35,7 @@ build/cer.p12
 .worktrees
 .claude/
 .serena/
+
+# Local agent/run artifacts
+.artifacts/
+.omo/
