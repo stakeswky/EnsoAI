@@ -640,6 +640,13 @@ export function useXterm({
               setIsLoading(false);
             }
             onDataRef.current?.(bufferedData);
+            const creditBytes = Buffer.byteLength(bufferedData, 'utf8');
+            if (event.streamSeq !== undefined && ptyIdRef.current) {
+              window.electronAPI.terminal.ackStream(ptyIdRef.current, {
+                streamSeq: event.streamSeq,
+                creditBytes,
+              });
+            }
             writeBufferRef.current = '';
           }
           isFlushPendingRef.current = false;
