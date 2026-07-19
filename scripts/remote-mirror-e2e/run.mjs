@@ -4,8 +4,8 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { appendMetric, assertNoSecrets, createRunArtifactDir, writeSummary } from './fixtures.mjs';
 import { buildPromotionManifest } from './promotion-manifest.mjs';
-import { createTcpProxy } from './tcp-proxy.mjs';
 import { runDualElectronScenario } from './scenarios/dual-electron.mjs';
+import { createTcpProxy } from './tcp-proxy.mjs';
 
 const suite = process.argv.includes('--suite')
   ? process.argv[process.argv.indexOf('--suite') + 1]
@@ -118,7 +118,11 @@ if (suite === 'soak30m' || suite === 'soak8h') {
 
 if (suite === 'e2e') {
   await record('electron-multi-instance', async () =>
-    runDualElectronScenario({ artifactDir: dir })
+    runDualElectronScenario({
+      artifactDir: dir,
+      bind: process.env.ENSO_REMOTE_MIRROR_E2E_BIND ?? 'localhost',
+      connectHost: process.env.ENSO_REMOTE_MIRROR_E2E_CONNECT_HOST ?? '127.0.0.1',
+    })
   );
   await record('tailnet', async () => ({
     result: 'blocked',

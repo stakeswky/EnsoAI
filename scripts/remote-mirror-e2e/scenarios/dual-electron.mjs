@@ -1,5 +1,7 @@
-import { writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import {
   createInstanceWorkspace,
   diagnosticsAction,
@@ -8,6 +10,8 @@ import {
   resolveElectronBinary,
   waitForEndpointFile,
 } from '../electron-launch.mjs';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Dual Electron E2E:
@@ -18,6 +22,8 @@ import {
  */
 export async function runDualElectronScenario(options = {}) {
   const artifactDir = options.artifactDir;
+  const bind = options.bind ?? 'localhost';
+  const connectHost = options.connectHost ?? '127.0.0.1';
   const electronBinary = resolveElectronBinary();
   if (!electronBinary) {
     return {
@@ -59,18 +65,21 @@ export async function runDualElectronScenario(options = {}) {
 
     await diagnosticsAction(hostEndpoint, 'awaitReady', { timeoutMs: 30_000 });
     await diagnosticsAction(clientEndpoint, 'awaitReady', { timeoutMs: 30_000 });
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
 
     const hostStart = await diagnosticsAction(hostEndpoint, 'startRemoteHost', {
       port: 0,
       mirrorV2: true,
+      bind,
     });
     if (!hostStart?.running || !hostStart?.token || !hostStart?.port) {
       throw new Error(`host start failed: ${JSON.stringify(hostStart)}`);
     }
 
-    const seed = await diagnosticsAction(hostEndpoint, 'seedMinimalScene', {
-      repositoryPath: join(hostWs.dir, 'repo'),
-    });
+    const repositoryPath = join(hostWs.dir, 'repo');
+    await mkdir(repositoryPath, { recursive: true });
+    await execFileAsync('git', ['init', '--initial-branch=main'], { cwd: repositoryPath });
+    const seed = await diagnosticsAction(hostEndpoint, 'seedMinimalScene', { repositoryPath });
     if (!seed?.ok) {
       throw new Error(`seed failed: ${JSON.stringify(seed)}`);
     }
@@ -81,7 +90,7 @@ export async function runDualElectronScenario(options = {}) {
     }
 
     const connect = await diagnosticsAction(clientEndpoint, 'connectRemote', {
-      host: '127.0.0.1',
+      host: connectHost,
       port: hostStart.port,
       token: hostStart.token,
       deviceId: `e2e-client-${Date.now()}`,
@@ -124,6 +133,55 @@ export async function runDualElectronScenario(options = {}) {
       );
     }
 
+    let observerCreateRejected = false;
+    try {
+      await diagnosticsAction(clientEndpoint, 'createTerminal', {
+        cwd: seed.repositoryPath,
+        workspaceId: 'worktree-e2e',
+        sessionId: `e2e-observer-terminal-${Date.now()}`,
+      });
+    } catch {
+      observerCreateRejected = true;
+    }
+    if (!observerCreateRejected) {
+      throw new Error('observer terminal creation unexpectedly succeeded without control');
+    }
+
+    const control = await diagnosticsAction(clientEndpoint, 'requestControl', {});
+    if (!control?.ok || !control?.ownsControl) {
+      throw new Error(`client control transfer failed: ${JSON.stringify(control)}`);
+    }
+    const terminal = await diagnosticsAction(clientEndpoint, 'createTerminal', {
+      cwd: seed.repositoryPath,
+      workspaceId: 'worktree-e2e',
+      sessionId: `e2e-controller-terminal-${Date.now()}`,
+    });
+    if (!terminal?.ok || typeof terminal.sessionId !== 'string') {
+      throw new Error(`controller terminal creation failed: ${JSON.stringify(terminal)}`);
+    }
+
+    const terminalDeadline = Date.now() + 30_000;
+    let terminalHostDigest = hostDigestAfter;
+    let terminalClientDigest = clientDigest;
+    while (Date.now() < terminalDeadline) {
+      terminalHostDigest = await diagnosticsAction(hostEndpoint, 'getHostDigest');
+      terminalClientDigest = await diagnosticsAction(clientEndpoint, 'getClientDigest');
+      if (
+        terminalHostDigest.revision > hostDigestAfter.revision &&
+        terminalClientDigest.revision === terminalHostDigest.revision &&
+        terminalClientDigest.digest === terminalHostDigest.digest
+      ) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (
+      terminalClientDigest.revision !== terminalHostDigest.revision ||
+      terminalClientDigest.digest !== terminalHostDigest.digest
+    ) {
+      throw new Error('terminal scene did not converge after controller creation');
+    }
+
     // Disconnect client — local scene must not retain remote projection authority.
     await diagnosticsAction(clientEndpoint, 'disconnectRemote', {});
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -145,6 +203,11 @@ export async function runDualElectronScenario(options = {}) {
       clientRevision: clientDigest.revision,
       digestMatch: true,
       hostPort: hostStart.port,
+      hostBindAddress: hostStart.bindAddress,
+      connectHost,
+      observerCreateRejected,
+      controllerTerminalCreated: true,
+      terminalRevision: terminalHostDigest.revision,
       clientFinalState: afterDisconnect?.state ?? null,
     };
 

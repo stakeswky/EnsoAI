@@ -463,18 +463,25 @@ async function dispatchDiagnosticsUserAction(action: {
         typeof action.args.port === 'number' && Number.isFinite(action.args.port)
           ? action.args.port
           : 0;
+      const bind =
+        action.args.bind === 'all' ||
+        action.args.bind === 'tailscale' ||
+        action.args.bind === 'localhost'
+          ? action.args.bind
+          : 'localhost';
       const settings: RemoteHostSettings = {
         ...readRemoteHostSettings(),
         enabled: true,
-        bind: 'localhost',
+        bind,
         port: port > 0 ? port : 0,
-        mirrorV2Enabled: action.args.mirrorV2 === false ? false : true,
+        mirrorV2Enabled: action.args.mirrorV2 !== false,
       };
       persistRemoteHostSettings(settings);
       const status = await remoteHostServer.start(settings);
       return {
         running: status.running,
         port: status.port,
+        bindAddress: status.bindAddress,
         mirrorV2Enabled: status.mirrorV2Enabled === true,
         hasToken: Boolean(status.token),
         token: status.token,
@@ -527,10 +534,11 @@ async function dispatchDiagnosticsUserAction(action: {
       if (!service.isBootstrapReady()) {
         await service.completeBootstrapAfter(async () => undefined);
       }
-      const control = await service.requestControl({
-        clientId: 'diagnostics-host',
-        deviceId: 'diagnostics-host-device',
-      });
+      const currentControl = await service.getControllerLease();
+      const control = await service.requestControlTransfer(
+        { clientId: 'diagnostics-host', deviceId: 'diagnostics-host-device' },
+        currentControl?.coordSeq ?? 0
+      );
       if (!control.granted) {
         throw new Error(control.error?.message ?? 'failed to obtain host control for seed');
       }
@@ -588,8 +596,10 @@ async function dispatchDiagnosticsUserAction(action: {
         },
         actor
       );
+      await service.releaseControl(actor);
       return {
         ok: result.accepted,
+        repositoryPath: seedPath,
         revision: service.getSnapshot().revision,
         rejected: result.accepted ? null : result.error.code,
       };
@@ -606,11 +616,58 @@ async function dispatchDiagnosticsUserAction(action: {
       return { ok: false, ready: false };
     }
     case 'requestControl': {
+      if (primaryWindow && remoteClientManager.isAttached(primaryWindow.webContents.id)) {
+        const lease = await remoteClientManager.forward(
+          primaryWindow.webContents.id,
+          IPC_CHANNELS.WORKSPACE_MIRROR_REQUEST_CONTROL,
+          [{ allowTransfer: true }]
+        );
+        const status = remoteClientManager.getStatus(primaryWindow.webContents.id);
+        return { ok: true, ownsControl: status.mirrorOwnsControl === true, lease: Boolean(lease) };
+      }
       const service = getWorkspaceMirrorService();
       return service.requestControl({
         clientId: 'diagnostics-host',
         deviceId: 'diagnostics-host-device',
       });
+    }
+    case 'releaseControl': {
+      if (primaryWindow && remoteClientManager.isAttached(primaryWindow.webContents.id)) {
+        await remoteClientManager.forward(
+          primaryWindow.webContents.id,
+          IPC_CHANNELS.WORKSPACE_MIRROR_RELEASE_CONTROL,
+          []
+        );
+        return { ok: true };
+      }
+      return { ok: false, error: 'no remote client connection' };
+    }
+    case 'createTerminal': {
+      if (!primaryWindow || !remoteClientManager.isAttached(primaryWindow.webContents.id)) {
+        throw new Error('no remote client connection');
+      }
+      const cwd = typeof action.args.cwd === 'string' ? action.args.cwd : '';
+      const workspaceId =
+        typeof action.args.workspaceId === 'string' ? action.args.workspaceId : undefined;
+      const sessionId =
+        typeof action.args.sessionId === 'string'
+          ? action.args.sessionId
+          : `diagnostics-terminal-${Date.now()}`;
+      if (!cwd) throw new Error('createTerminal requires cwd');
+      const remoteSessionId = await remoteClientManager.forward(
+        primaryWindow.webContents.id,
+        IPC_CHANNELS.TERMINAL_CREATE,
+        [
+          {
+            cwd,
+            sessionId,
+            persistent: true,
+            title: 'Diagnostics Terminal',
+            ...(workspaceId ? { workspaceId } : {}),
+          },
+        ]
+      );
+      return { ok: true, sessionId: remoteSessionId };
     }
     default:
       return { ok: false, error: `action-not-implemented:${action.name}` };
