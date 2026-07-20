@@ -175,6 +175,13 @@ export function registerTerminalHandlers(): void {
     IPC_CHANNELS.TERMINAL_ATTACH,
     async (event, id: string, options: TerminalAttachOptions = {}) => {
       ensureTerminalCleanup(event.sender);
+      // Expected after app restart: the renderer restores a persisted scene
+      // whose PTY no longer exists. Return null instead of throwing so
+      // Electron does not log a handler rejection; the preload converts null
+      // back into an error and the renderer recreates the session.
+      if (!terminalSessionRegistry.has(id)) {
+        return null;
+      }
       return terminalSessionRegistry.attach(id, {
         subscriberId: terminalSubscriberId(event.sender),
         afterStreamSeq: options.afterStreamSeq,

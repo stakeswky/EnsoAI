@@ -418,8 +418,19 @@ const electronAPI = {
     resize: (id: string, size: TerminalResizeOptions): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_RESIZE, id, size),
     destroy: (id: string): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_DESTROY, id),
-    attach: (id: string, options?: TerminalAttachOptions): Promise<TerminalAttachResult> =>
-      ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_ATTACH, id, options),
+    attach: async (id: string, options?: TerminalAttachOptions): Promise<TerminalAttachResult> => {
+      const result = (await ipcRenderer.invoke(
+        IPC_CHANNELS.TERMINAL_ATTACH,
+        id,
+        options
+      )) as TerminalAttachResult | null;
+      if (!result) {
+        // Main returns null for unknown sessions (e.g. after app restart) to
+        // avoid noisy handler-rejection logs; surface it as an error locally.
+        throw new Error(`Unknown terminal session: ${id}`);
+      }
+      return result;
+    },
     detach: (id: string): Promise<boolean> => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_DETACH, id),
     listPersistent: (): Promise<TerminalPersistentSessionInfo[]> =>
       ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_LIST_PERSISTENT),
